@@ -167,3 +167,6 @@ Commits on main that neither upstream has, oldest first.
 | `3b8beb5` | winemetal: remove the gpuarchiver folders the pipeline cache leaves |
 | `1dea20e` | winemetal: drop the shader cache tables of other converter versions |
 | `8a02f3f` | winemetal: raise the pipeline cache's default cap to 10 GB |
+| `f725b18` | d3d12: time Metal 4 passes between encoders, in heaps of the profile's own |
+| `103b121` | d3d12: a profile ends compute and copy passes at application events |
+| `2a323ca` | tests: held.py checks the profile's passes against command buffer spans |
