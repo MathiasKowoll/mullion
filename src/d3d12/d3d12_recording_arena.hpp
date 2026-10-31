@@ -29,7 +29,12 @@ public:
       VirtualFree(base, 0, MEM_RELEASE);
   }
 
-  // blocks are what the system gives address space in
+  // blocks are what the system gives address space in. the arguments arena is wrapped in one Metal buffer without a
+  // copy, and Metal refuses a range whose host mappings do not begin and end on its 16 KB pages. Wine on a 4 KB host
+  // map can leave such a boundary inside the range: it maps more than it needs at any address and unmaps the head up
+  // to the 64 KB boundary, while macOS has already cut that mapping into 128 MB pieces from where it began.
+  // decommitting the whole range has Wine map it again from its start, and committing it again only changes its
+  // protection, so the pieces then begin at the range's own start. it holds nothing yet, so nothing is lost
   bool
   Initialize() {
     if (base)
@@ -38,7 +43,14 @@ public:
     GetSystemInfo(&system);
     block_ = system.dwAllocationGranularity;
     used_.assign(kSize / block_, false);
-    return (base = VirtualAlloc(nullptr, kSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    void *reserved = VirtualAlloc(nullptr, kSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!reserved)
+      return false;
+    if (!VirtualFree(reserved, kSize, MEM_DECOMMIT) || !VirtualAlloc(reserved, kSize, MEM_COMMIT, PAGE_READWRITE)) {
+      VirtualFree(reserved, 0, MEM_RELEASE);
+      return false;
+    }
+    return (base = reserved);
   }
 
   // the first whole blocks in one piece that hold `bytes`
