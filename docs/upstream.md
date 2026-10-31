@@ -170,3 +170,4 @@ Commits on main that neither upstream has, oldest first.
 | `f725b18` | d3d12: time Metal 4 passes between encoders, in heaps of the profile's own |
 | `103b121` | d3d12: a profile ends compute and copy passes at application events |
 | `2a323ca` | tests: held.py checks the profile's passes against command buffer spans |
+| `43f3bb2` | nvapi: a function it does not implement is named once |

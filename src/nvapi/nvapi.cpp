@@ -7,6 +7,7 @@
 #include "winemetal.h"
 #include "wsi_monitor.hpp"
 #include <string>
+#include <unordered_set>
 #define __NVAPI_EMPTY_SAL
 #include "nvapi.h"
 #include "nvapi_interface.h"
@@ -903,6 +904,15 @@ extern "C" __cdecl void *nvapi_QueryInterface(NvU32 id) {
     break;
   }
 
+  // the NVAPI library asks again on every call it makes through a function it was not given: Phantom Blade Zero asked
+  // for NvAPI_D3D12_SetNvShaderExtnSlotSpaceLocalThread 4,907 times while it loaded, so each is named once
+  static mullion::mutex reported_mutex;
+  static std::unordered_set<NvU32> reported;
+  {
+    std::lock_guard<mullion::mutex> lock(reported_mutex);
+    if (!reported.insert(id).second)
+      return nullptr;
+  }
   for (auto &iface : nvapi_interface_table) {
     if (iface.id == id) {
       ERR("nvapi: function ", iface.func, " not implemented");
