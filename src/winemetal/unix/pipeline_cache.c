@@ -13,11 +13,13 @@
  * library's tag, its name and the constants' indices and types; a pipeline's key is
  * a hash of its functions' tags. A pipeline is first made with only the archives
  * filed under its key and MTLPipelineOptionFailOnBinaryArchiveMiss, and they are
- * let go; missed, it is made as asked and written to an archive of its own,
+ * let go; missed, it is compiled once into an archive of its own, made from it and
+ * the archive written,
  * pipelines/<GPU>-<OS build>/<xx>/<key>-<pid>-<n>.bin beside Mullion's cache, off
  * the calling thread. The key leaves out pipeline state: Metal matches the whole
  * pipeline in the archives, so a key several pipelines share costs only another
- * file to open. MULLION_PIPELINE_CACHE=0 turns it off.
+ * file to open. What is written stops at MULLION_PIPELINE_CACHE_MAX_MB (4096).
+ * MULLION_PIPELINE_CACHE=0 turns it off.
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -41,7 +43,8 @@ static NSString *directory;               /* nil when the cache is off */
 static dispatch_queue_t keep_queue;
 static dispatch_group_t keep_group;
 static atomic_uint written;
-static atomic_ullong hits, misses, unkeyed, opened, kept_failed;
+static atomic_ullong hits, misses, unkeyed, opened, kept_failed, kept_bytes, kept_count, over_cap;
+static uint64_t cap_bytes;
 
 static NSString *
 sanitized(NSString *text) {
@@ -54,9 +57,12 @@ report(void) {
   if (!directory)
     return;
   dispatch_group_wait(keep_group, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
-  fprintf(stderr, "mullion: pipeline cache: %llu found, %llu compiled and kept, %llu not keyed, %llu archives opened\n",
-          (unsigned long long)hits, (unsigned long long)misses, (unsigned long long)unkeyed,
-          (unsigned long long)opened);
+  fprintf(stderr,
+          "mullion: pipeline cache: %llu found, %llu compiled, %llu kept (%.1f MB, %.0f KB each), %llu not kept over the "
+          "%llu MB cap, %llu not keyed, %llu archives opened\n",
+          (unsigned long long)hits, (unsigned long long)misses, (unsigned long long)kept_count, kept_bytes / 1e6,
+          kept_count ? kept_bytes / 1e3 / kept_count : 0.0, (unsigned long long)over_cap,
+          (unsigned long long)(cap_bytes >> 20), (unsigned long long)unkeyed, (unsigned long long)opened);
 }
 
 /* The folder, beside the one Mullion gave Metal's cache, and what is in it. */
@@ -102,10 +108,15 @@ setup(void) {
       bytes += walk.fileAttributes.fileSize;
       files++;
     }
+    /* A first run of PBZ wrote 30 GB in minutes and filled the disk: what is kept stops at a cap. */
+    const char *cap = getenv("MULLION_PIPELINE_CACHE_MAX_MB");
+    cap_bytes = (uint64_t)(cap && atoll(cap) > 0 ? atoll(cap) : 4096) << 20;
+    atomic_store(&kept_bytes, bytes);
     keep_queue = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
     keep_group = dispatch_group_create();
-    fprintf(stderr, "mullion: pipeline cache: %llu pipelines in %lu keys (%.1f MB) in %s\n",
-            (unsigned long long)files, (unsigned long)index_files.count, bytes / 1e6, directory.UTF8String);
+    fprintf(stderr, "mullion: pipeline cache: %llu pipelines in %lu keys (%.1f MB of %llu MB) in %s\n",
+            (unsigned long long)files, (unsigned long)index_files.count, bytes / 1e6,
+            (unsigned long long)(cap_bytes >> 20), directory.UTF8String);
     atexit(report);
   }
 }
@@ -230,44 +241,64 @@ pc_make(id<MTLDevice> device, id descriptor, char kind, id<MTLFunction> const *f
       return state;
     }
   }
-  id state = make(descriptor, MTLPipelineOptionNone, error);
-  if (!state)
-    return state;
+  /* A miss is compiled once, into an archive of its own, and made from it: compiling the
+   * pipeline and then adding it compiled everything twice, and a first run took minutes more. */
   atomic_fetch_add(&misses, 1);
-  [descriptor retain];
+  id<MTLBinaryArchive> archive = nil;
+  id state = nil;
+  if (atomic_load(&kept_bytes) < cap_bytes) {
+    MTLBinaryArchiveDescriptor *empty = [[MTLBinaryArchiveDescriptor alloc] init];
+    archive = [device newBinaryArchiveWithDescriptor:empty error:nil];
+    [empty release];
+    NSError *failure = nil;
+    if (archive && add(archive, descriptor, &failure)) {
+      id mine = [descriptor copy];
+      [mine setBinaryArchives:@[archive]];
+      NSError *missed = nil;
+      state = make(mine, MTLPipelineOptionFailOnBinaryArchiveMiss, &missed);
+      [mine release];
+    } else if (atomic_fetch_add(&kept_failed, 1) < 5)
+      fprintf(stderr, "mullion: pipeline cache: keeping a pipeline failed: %s\n",
+              failure.localizedDescription.UTF8String ?: "unknown");
+    if (!state) {
+      [archive release];
+      archive = nil;
+    }
+  } else
+    atomic_fetch_add(&over_cap, 1);
+  if (!state)
+    state = make(descriptor, MTLPipelineOptionNone, error);
+  if (!state || !archive) {
+    [archive release];
+    return state;
+  }
   [key retain];
-  pc_add_block kept_add = [add copy];
   dispatch_group_async(keep_group, keep_queue, ^{
     @autoreleasepool {
-      MTLBinaryArchiveDescriptor *empty = [[MTLBinaryArchiveDescriptor alloc] init];
-      id<MTLBinaryArchive> archive = [device newBinaryArchiveWithDescriptor:empty error:nil];
-      [empty release];
       NSError *failure = nil;
       NSString *folder = [directory stringByAppendingPathComponent:[key substringToIndex:2]];
       NSString *path = [folder stringByAppendingPathComponent:[NSString stringWithFormat:@"%@-%d-%u.bin", key, getpid(),
                                                                          atomic_fetch_add(&written, 1)]];
-      BOOL done = archive && kept_add(archive, descriptor, &failure);
-      if (done) {
-        [[NSFileManager defaultManager] createDirectoryAtPath:folder withIntermediateDirectories:YES attributes:nil
-                                                        error:nil];
-        done = [archive serializeToURL:[NSURL fileURLWithPath:path] error:&failure];
-      }
-      if (!done && atomic_fetch_add(&kept_failed, 1) < 5)
-        fprintf(stderr, "mullion: pipeline cache: keeping a pipeline failed: %s\n",
-                failure.localizedDescription.UTF8String ?: "unknown");
-      if (done) {
+      [[NSFileManager defaultManager] createDirectoryAtPath:folder withIntermediateDirectories:YES attributes:nil
+                                                      error:nil];
+      if ([archive serializeToURL:[NSURL fileURLWithPath:path] error:&failure]) {
+        uint64_t size = [[[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil] fileSize];
+        atomic_fetch_add(&kept_bytes, size);
+        if (atomic_fetch_add(&kept_count, 1) % 1000 == 999)
+          fprintf(stderr, "mullion: pipeline cache: %llu kept, %.1f MB, %.0f KB each\n",
+                  (unsigned long long)kept_count, kept_bytes / 1e6, kept_bytes / 1e3 / kept_count);
         pthread_mutex_lock(&index_mutex);
         NSMutableArray *list = index_files[key];
         if (!list)
           index_files[key] = list = [NSMutableArray array];
         [list addObject:path];
         pthread_mutex_unlock(&index_mutex);
-      }
-      [archive release];
+      } else if (atomic_fetch_add(&kept_failed, 1) < 5)
+        fprintf(stderr, "mullion: pipeline cache: writing a pipeline failed: %s\n",
+                failure.localizedDescription.UTF8String ?: "unknown");
     }
-    [descriptor release];
+    [archive release];
     [key release];
-    [kept_add release];
   });
   return state;
 }
