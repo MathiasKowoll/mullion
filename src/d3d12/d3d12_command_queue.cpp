@@ -550,6 +550,9 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     // the timestamp queries the command buffer samples: the device's counter sample buffer it holds until it
     // completes, and where each sample taken is with the queries it is for
     WMT::Reference<WMT::CounterSampleBuffer> samples{};
+    // how many of its samples the queries took, and each sample taken with its queries: a sample of a pass the
+    // profile samples is that pass's end in the profile's heaps (ProfileBuffer: an index past the device's limit)
+    uint32_t taken = 0;
     std::vector<std::pair<uint64_t, std::vector<std::pair<Com<MTLD3D12QueryHeap>, uint32_t>>>> sampled{};
     // the resolves of timestamps into readback buffers, which the CPU does when the command buffer completes
     struct Resolve {
@@ -572,13 +575,19 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     std::array<uint32_t, WMTMetal4AccelerationStructure + 1> physical{};
   };
 
+  // the profile's samples are in heaps of their own, as many as the command buffer's passes take, so a pass is never
+  // left unsampled for want of room, nor takes a query's. sample i of heap k is the command buffer's sample
+  // (k + 1) * limit + i, after the queries' heap (InflightCommandBuffer::samples)
   struct ProfileBuffer {
-    uint32_t samples = 0;
+    std::vector<WMT::Reference<WMT::CounterSampleBuffer>> heaps;
+    // the samples taken from the last heap
+    uint32_t used = 0;
     uint64_t committed = 0, cpu_begin = 0, gpu_begin = 0;
     struct Pass {
       const EncoderData *pass;
       uint64_t id;
       EncoderType type;
+      // `first` is ~0u for a pass left unsampled: Metal made no heap
       uint32_t first, count, last;
       uint64_t encoding;
       std::string event;
@@ -588,6 +597,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   struct ProfileQueue {
     static inline std::atomic_uint64_t queues{0};
     uint64_t id = ++queues;
+    bool short_of_heaps = false;
     std::array<ProfileBuffer, kCommandQueueSize> buffers;
   };
   std::unique_ptr<ProfileQueue> profile_ = diag::profile ? std::make_unique<ProfileQueue>() : nullptr;
@@ -665,6 +675,12 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       inflight.gate->closed.wait(true);
       // a cancelled gate's: it never runs, and nothing of the queue's follows it
       if (inflight.cmdbuf.status() < WMTCommandBufferStatusCommitted) {
+        if (profile_) {
+          auto &buffer = profile_->buffers[internal_seq % kCommandQueueSize];
+          for (auto &heap : buffer.heaps)
+            device_->timestamp_samples.Return(std::move(heap));
+          buffer = {};
+        }
         for (auto &allocator : inflight.allocators)
           if (allocator)
             allocator->pending--;
@@ -714,13 +730,22 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         device_->LoseDevice();
       }
 
-      std::vector<uint64_t> clock(profile_ && profile_->buffers[internal_seq % kCommandQueueSize].samples
-                                      ? device_->timestamp_samples.limit
-                                      : inflight.sampled.size(),
+      // the queries' samples, then the profile's heaps, each at a multiple of the limit
+      auto limit = device_->timestamp_samples.limit;
+      auto *heaps = profile_ ? &profile_->buffers[internal_seq % kCommandQueueSize].heaps : nullptr;
+      std::vector<uint64_t> clock(heaps && !heaps->empty() ? size_t(limit) * (heaps->size() + 1) : inflight.taken,
                                   profile_ ? ~uint64_t(0) : 0);
       if (inflight.samples) {
-        inflight.samples.resolveCounterRange(0, clock.size(), clock.data(), clock.size() * sizeof(uint64_t));
+        inflight.samples.resolveCounterRange(0, inflight.taken, clock.data(), inflight.taken * sizeof(uint64_t));
         device_->timestamp_samples.Return(std::move(inflight.samples));
+      }
+      if (heaps) {
+        auto used = profile_->buffers[internal_seq % kCommandQueueSize].used;
+        for (size_t k = 0; k < heaps->size(); k++) {
+          uint32_t count = k + 1 == heaps->size() ? used : limit;
+          (*heaps)[k].resolveCounterRange(0, count, &clock[(k + 1) * limit], count * sizeof(uint64_t));
+          device_->timestamp_samples.Return(std::move((*heaps)[k]));
+        }
       }
       if (profile_) {
         auto &buffer = profile_->buffers[internal_seq % kCommandQueueSize];
@@ -1298,11 +1323,6 @@ public:
     }
     static const bool isolate = !env::getEnvVar("MULLION_D3D12_ISOLATE").empty();
     MetalCommandBuffer cmdbuf = scope.inflight->cmdbuf;
-    uint64_t queries = 0;
-    if (profile_)
-      for (auto list : recorded)
-        for (auto pass = list; pass; pass = pass->next)
-          queries += !!pass->stamps;
     // ends the command buffer and waits for it: what the work so far leaves in memory is then there
     auto settle = [&] {
       std::shared_ptr<GPURecordChecks> checks;
@@ -1384,9 +1404,11 @@ public:
         scope.inflight->encoders[size_t(current->type)]++;
         WMTSampleBufferAttachmentInfo attachment{};
         typename ProfileBuffer::Pass *profiled = nullptr;
+        // where the profile's heap of the pass begins in the command buffer's samples
+        uint32_t profile_base = 0;
         auto &pool = device_->timestamp_samples;
-        // a command buffer has one buffer of samples: when it is full the next begins
-        if (current->stamps && scope.inflight->samples && scope.inflight->sampled.size() == pool.limit) {
+        // a command buffer has one buffer of samples for its queries: when it is full the next begins
+        if (current->stamps && scope.inflight->samples && scope.inflight->taken == pool.limit) {
           scope.End();
           scope.Start();
           cmdbuf = scope.inflight->cmdbuf;
@@ -1400,31 +1422,42 @@ public:
              current->type == EncoderType::ComputeParts ||
              current->type == EncoderType::Resolve || current->type == EncoderType::AccelerationStructure)) {
           auto &buffer = profile_->buffers[inflight_cmdbuf_seq_.load() % kCommandQueueSize];
-          if (!scope.inflight->samples && buffer.passes.empty())
-            scope.inflight->samples = pool.Take(device_->GetMTLDevice(), false, Metal4);
-          auto count = current->type == EncoderType::Render ? WMTRenderTimestampSamples : WMTTimestampSamplesPerStage;
-          uint32_t first = ~0u;
-          // queries keep their slots; extra profile passes stay unsampled instead of splitting a command buffer
-          if (scope.inflight->samples &&
-              count <= pool.limit - buffer.samples -
-                           std::min<uint64_t>(scope.inflight->sampled.size() + queries, pool.limit)) {
-            buffer.samples += count;
-            first = pool.limit - buffer.samples;
-            attachment = {scope.inflight->samples, first, first + count - 1};
+          // Metal 3 samples a render pass's vertex and fragment stages; Metal 4 times each pass between encoders
+          // (metal4_stamp in winemetal_unix.c)
+          uint32_t count = current->type == EncoderType::Render && !Metal4 ? WMTRenderTimestampSamples
+                                                                         : WMTTimestampSamplesPerStage;
+          if (buffer.heaps.empty() || buffer.used + count > pool.limit) {
+            // a heap another command buffer holds returns as it completes: one this buffer would wait for cannot
+            if (auto heap = pool.Take(device_->GetMTLDevice(), false, Metal4)) {
+              buffer.heaps.push_back(std::move(heap));
+              buffer.used = 0;
+            } else if (!std::exchange(profile_->short_of_heaps, true)) {
+              WARN("Mullion profile: Metal made no more timestamp heaps; passes are left unsampled");
+            }
           }
-          buffer.passes.push_back({current, current->id, current->type, first, uint32_t(count),
-                                   uint32_t(attachment.end_of_encoder_sample_index), diag::Now(), event});
+          uint32_t first = ~0u;
+          if (!buffer.heaps.empty() && buffer.used + count <= pool.limit) {
+            profile_base = pool.limit * uint32_t(buffer.heaps.size());
+            attachment = {buffer.heaps.back(), buffer.used, buffer.used + count - 1};
+            first = profile_base + buffer.used;
+            buffer.used += count;
+          }
+          buffer.passes.push_back({current, current->id, current->type, first, count, first + count - 1, diag::Now(),
+                                   event});
           profiled = &buffer.passes.back();
         }
         if (current->stamps) {
-          if (profile_)
-            queries--;
-          if (!scope.inflight->samples && !(scope.inflight->samples = pool.Take(device_->GetMTLDevice(), true, Metal4))) {
+          // the profile's sample of the pass's end is the queries' too
+          if (attachment.sample_buffer) {
+            auto &[slot, taken] = scope.inflight->sampled.emplace_back();
+            slot = profile_base + attachment.end_of_encoder_sample_index;
+            for (auto stamp = current->stamps; stamp; stamp = stamp->next)
+              taken.push_back({stamp->heap, stamp->query});
+          } else if (!scope.inflight->samples &&
+                     !(scope.inflight->samples = pool.Take(device_->GetMTLDevice(), true, Metal4))) {
             ERR("EndQuery: Metal has no counter sample buffer for a timestamp");
           } else {
-            // the profile's sample of the pass's end is the queries' too
-            if (!attachment.sample_buffer)
-              attachment = {scope.inflight->samples, ~0ull /* MTLCounterDontSample */, scope.inflight->sampled.size()};
+            attachment = {scope.inflight->samples, ~0ull /* MTLCounterDontSample */, scope.inflight->taken++};
             auto &[slot, taken] = scope.inflight->sampled.emplace_back();
             slot = attachment.end_of_encoder_sample_index;
             for (auto stamp = current->stamps; stamp; stamp = stamp->next)
@@ -1596,7 +1629,7 @@ public:
           profiled->encoding = diag::Now() - profiled->encoding;
           // Metal 4 may start the pass with the sample the pass before it ended with
           if (profiled->first != ~0u)
-            profiled->first = uint32_t(attachment.start_of_encoder_sample_index);
+            profiled->first = profile_base + uint32_t(attachment.start_of_encoder_sample_index);
         }
         current = current->next;
         // what an application's pass has filled may be what a deserialized top-level structure waited for

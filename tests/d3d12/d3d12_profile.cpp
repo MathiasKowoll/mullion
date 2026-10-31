@@ -634,7 +634,9 @@ main(int argc, char **argv) {
         if (!expect(buffers.count(key), "pass has no command buffer"))
           continue;
         expect(!presented.count(key), "presenter's own pass was sampled");
-        expect(row.size() == (row[4] == "Render" ? 11u : 9u), "wrong stage count");
+        // Metal 3 samples a render pass's vertex and fragment stages, Metal 4 each pass from the command buffer's
+        // timestamp before it to its own
+        expect(row.size() == 9u || (row[4] == "Render" && row.size() == 11u), "wrong stage count");
         expect(number(row[5]) > 0, "empty CPU encoding time");
         UINT64 gpu = 0;
         auto &cmdbuf = buffers[key];
@@ -695,7 +697,8 @@ main(int argc, char **argv) {
       expect(kinds["Render"] == frames && kinds["Compute"] == 2 * frames && kinds["Clear"] == capacity + 1 &&
                  kinds["Blit"] == 2 * frames + 1 && kinds.size() == 4,
              "pass kinds or counts differ from recording");
-      expect(unsampled > 0, "overflow did not use unsampled sentinel");
+      // a command buffer's passes take as many counter buffers as they need
+      expect(!unsampled, "%u passes past one counter buffer were left unsampled", unsampled);
       for (UINT i = 0; i < std::size(render_runs); i++)
         expect(run_counts[render_runs[i]] == frames && run_counts[compute_runs[i]] == frames,
                "pipeline lost on list replay");
