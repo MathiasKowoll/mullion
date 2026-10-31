@@ -171,3 +171,4 @@ Commits on main that neither upstream has, oldest first.
 | `103b121` | d3d12: a profile ends compute and copy passes at application events |
 | `2a323ca` | tests: held.py checks the profile's passes against command buffer spans |
 | `43f3bb2` | nvapi: a function it does not implement is named once |
+| `8bd6b15` | d3d12: the recording arena's mappings begin where it begins |
