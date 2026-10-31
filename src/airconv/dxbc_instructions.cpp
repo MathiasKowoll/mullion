@@ -56,6 +56,13 @@ auto readOperandRelativeIndex(
     };
   }
 
+  // a hull shader indexes its input patch with the control point it runs for
+  case D3D11_SB_OPERAND_TYPE_OUTPUT_CONTROL_POINT_ID: {
+    return IndexByControlPointId{
+      .offset = offset,
+    };
+  }
+
   case D3D10_SB_OPERAND_TYPE_INDEXABLE_TEMP: {
     return IndexByIndexableTempComponent{
       .regfile = OpIndex.m_RelIndex,
@@ -1878,7 +1885,6 @@ Instruction readInstruction(
     return inst;
   };
   case microsoft::D3D11_SB_OPCODE_ATOMIC_CMP_STORE: {
-    shader_info.use_cmp_exch = true;
     auto inst = InstAtomicImmCmpExchange{
       .dst = DstOperandSideEffect{._ = {.mask = 0b1111, .write_type = OperandDataType::Integer}},
       .dst_resource = readAtomicDst(Inst.m_Operands[0], phase),
@@ -1936,7 +1942,6 @@ Instruction readInstruction(
   };
 
   case microsoft::D3D11_SB_OPCODE_IMM_ATOMIC_CMP_EXCH: {
-    shader_info.use_cmp_exch = true;
     auto inst = InstAtomicImmCmpExchange{
       .dst = readDstOperand(Inst.m_Operands[0], phase, OperandDataType::Integer),
       .dst_resource = readAtomicDst(Inst.m_Operands[1], phase),

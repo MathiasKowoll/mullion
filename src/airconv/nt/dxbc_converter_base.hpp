@@ -121,6 +121,7 @@ public:
   }
   llvm::Value *LoadOperandIndex(const IndexByIndexableTempComponent &SrcOpIndex);
   llvm::Value *LoadOperandIndex(const IndexByTempComponent &SrcOpIndex);
+  llvm::Value *LoadOperandIndex(const IndexByControlPointId &SrcOpIndex);
 
   llvm::Value *
   LoadOperandIndex(const OperandIndex &SrcOpIndex) {

@@ -44,6 +44,14 @@ public:
   llvm::SmallVector<char, 0> buf;
 };
 
+// a call owns the error it writes into until it fails, and hands it to the caller only then: one that succeeds frees it
+#define SM50_RETURN_ERROR(errorObj, ppError, errorCode)                                                                \
+  do {                                                                                                                 \
+    if (ppError)                                                                                                       \
+      *(ppError) = (sm50_error_t)(errorObj).release();                                                                 \
+    return errorCode;                                                                                                  \
+  } while (0)
+
 namespace mullion::dxbc {
 
 inline mullion::shader::common::ResourceType
@@ -240,9 +248,6 @@ void setup_temp_register(
     resource_map.indexable_temp_map[idx] = {
       ptr_int_vec, ptr_float_vec, (uint32_t)channel_count
     };
-  }
-  if (shader_info->use_cmp_exch) {
-    resource_map.cmp_exch_temp = builder.CreateAlloca(types._int);
   }
 }
 
@@ -1654,21 +1659,19 @@ static int SM50InitializeUncached(
   if (ppError) {
     *ppError = nullptr;
   }
-  auto errorObj = new SM50ErrorInternal();
+  auto errorObj = std::make_unique<SM50ErrorInternal>();
   llvm::raw_svector_ostream errorOut(errorObj->buf);
 
   if (ppShader == nullptr) {
     errorOut << "ppShader can not be null\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   ResetRefused();
   CDXBCParser DXBCParser;
   if (DXBCParser.ReadDXBC(pBytecode, BytecodeSize) != S_OK) {
     errorOut << "Invalid DXBC bytecode\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   UINT codeBlobIdx = DXBCParser.FindNextMatchingBlob(DXBC_GenericShaderEx);
@@ -1678,8 +1681,7 @@ static int SM50InitializeUncached(
   UINT dxilBlobIdx = DXBCParser.FindNextMatchingBlob(DXBC_DXIL);
   if (codeBlobIdx == DXBC_BLOB_NOT_FOUND && dxilBlobIdx == DXBC_BLOB_NOT_FOUND) {
     errorOut << "Invalid DXBC bytecode: shader blob not found\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   // DxilProgramHeader's version word has the shader's kind: a library has no signatures, only functions
@@ -1688,17 +1690,17 @@ static int SM50InitializeUncached(
   CSignatureParser inputParser;
   if (!library && DXBCGetInputSignature(pBytecode, &inputParser) != S_OK) {
     errorOut << "Invalid DXBC bytecode: input signature not found\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
   CSignatureParser5 outputParser;
   if (!library && DXBCGetOutputSignature(pBytecode, &outputParser) != S_OK) {
     errorOut << "Invalid DXBC bytecode: output signature not found\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
-  auto sm50_shader = new SM50ShaderInternal();
+  // owned here until it is handed to the caller, so a shader that is refused is freed
+  auto sm50_shader_owned = std::make_unique<SM50ShaderInternal>();
+  auto sm50_shader = sm50_shader_owned.get();
   auto shader_info = &(sm50_shader->shader_info);
 
   if (!library) {
@@ -1715,9 +1717,7 @@ static int SM50InitializeUncached(
     DXBCGetPatchConstantSignature(pBytecode, &patchParser);
     if (auto err = read_dxil(DXBCParser.GetBlob(dxilBlobIdx), sm50_shader, inputParser, outputParser, patchParser)) {
       errorOut << llvm::toString(std::move(err));
-      delete sm50_shader;
-      *ppError = (sm50_error_t)errorObj;
-      return 1;
+      SM50_RETURN_ERROR(errorObj, ppError, 1);
     }
   } else {
     // 1. Collect information about the shader.
@@ -1732,14 +1732,12 @@ static int SM50InitializeUncached(
       errorOut << reason;
     else
       errorOut << "Invalid DXBC bytecode: " << reason;
-    delete sm50_shader;
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   // a library's shaders bind their resources through root signatures only
   if (library) {
-    *ppShader = sm50_shader;
+    *ppShader = (sm50_shader_t)sm50_shader_owned.release();
     return 0;
   }
 
@@ -1987,8 +1985,7 @@ static int SM50InitializeUncached(
       auto threads_per_patch = next_pow2(sm50_shader->hull_maximum_threads_per_patch);
       if (threads_per_patch > 32) {
         errorOut << "Threadgroup size of tessellation pipeline is too large.";
-        *ppError = (sm50_error_t)errorObj;
-        return 1;
+        SM50_RETURN_ERROR(errorObj, ppError, 1);
       }
       auto patch_per_group = 32 / threads_per_patch;
       float max_tesselation_factor = sm50_shader->max_tesselation_factor;
@@ -1999,8 +1996,7 @@ static int SM50InitializeUncached(
             max_tesselation_factor = std::max(max_tesselation_factor - 2.0f, 1.0f);
           } else {
             errorOut << "Payload size of tessellation pipeline is too large.";
-            *ppError = (sm50_error_t)errorObj;
-            return 1;
+            SM50_RETURN_ERROR(errorObj, ppError, 1);
           }
         } else {
           patch_per_group = patch_per_group >> 1;
@@ -2028,14 +2024,13 @@ static int SM50InitializeUncached(
       };
     }
     if (sm50_shader->shader_type == microsoft::D3D10_SB_GEOMETRY_SHADER) {
-      if (binding_cbuffer_mask || binding_sampler_mask || binding_uav_mask ||
-          binding_srv_hi_mask || binding_srv_lo_mask ||
-          !CheckGSBBIsPassThrough(sm50_shader->entry())) {
+      // a shader that only moves its inputs to its outputs is skipped only when its signature says the same: one
+      // whose outputs are not inputs of the same register and name, or that has another stream, runs
+      if (binding_cbuffer_mask || binding_sampler_mask || binding_uav_mask || binding_srv_hi_mask ||
+          binding_srv_lo_mask ||
+          !(CheckGSBBIsPassThrough(sm50_shader->entry()) &&
+            CheckGSSignatureIsPassThrough(inputParser, outputParser, pRefl->GeometryShader.Data))) {
         pRefl->GeometryShader.GSPassThrough = ~0u;
-      } else {
-        CheckGSSignatureIsPassThrough(
-          inputParser, outputParser, pRefl->GeometryShader.Data
-        );
       }
       pRefl->GeometryShader.Primitive = sm50_shader->gs_input_primitive;
       pRefl->GeometryShader.InstanceCount = sm50_shader->gs_instance_count;
@@ -2079,7 +2074,7 @@ static int SM50InitializeUncached(
     pRefl->ArgumentTableQwords = binding_table.Size();
   }
 
-  *ppShader = sm50_shader;
+  *ppShader = (sm50_shader_t)sm50_shader_owned.release();
   return 0;
 };
 
@@ -2199,12 +2194,11 @@ AIRCONV_API int SM50Compile(
   if (ppError) {
     *ppError = nullptr;
   }
-  auto errorObj = new SM50ErrorInternal();
+  auto errorObj = std::make_unique<SM50ErrorInternal>();
   llvm::raw_svector_ostream errorOut(errorObj->buf);
   if (ppBitcode == nullptr) {
     errorOut << "ppBitcode can not be null\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   // pArgs is ignored for now
@@ -2226,8 +2220,7 @@ AIRCONV_API int SM50Compile(
         result = SM50_COMPILE_UNRESOLVED;
       error.log(errorOut);
     });
-    *ppError = (sm50_error_t)errorObj;
-    return result;
+    SM50_RETURN_ERROR(errorObj, ppError, result);
   }
 
   if (shader_info.use_msad)
@@ -2236,8 +2229,7 @@ AIRCONV_API int SM50Compile(
     linkSamplePos(*pModule);
 
   if (!runOptimizationPasses(*pModule, errorOut)) {
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   // Serialize AIR
@@ -2266,12 +2258,11 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
   if (ppError) {
     *ppError = nullptr;
   }
-  auto errorObj = new SM50ErrorInternal();
+  auto errorObj = std::make_unique<SM50ErrorInternal>();
   llvm::raw_svector_ostream errorOut(errorObj->buf);
   if (ppBitcode == nullptr) {
     errorOut << "ppBitcode can not be null\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   // pArgs is ignored for now
@@ -2290,8 +2281,7 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
         FunctionName, context, *pModule, pHullShaderArgs
       )) {
     errorOut << llvm::toString(std::move(err));
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   if (shader_info.use_msad)
@@ -2301,8 +2291,7 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
   linkTessellation(*pModule);
 
   if (!runOptimizationPasses(*pModule, errorOut)) {
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   // Serialize AIR
@@ -2331,12 +2320,11 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
   if (ppError) {
     *ppError = nullptr;
   }
-  auto errorObj = new SM50ErrorInternal();
+  auto errorObj = std::make_unique<SM50ErrorInternal>();
   llvm::raw_svector_ostream errorOut(errorObj->buf);
   if (ppBitcode == nullptr) {
     errorOut << "ppBitcode can not be null\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   // pArgs is ignored for now
@@ -2363,8 +2351,7 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
                                        (dxbc::SM50ShaderInternal *)pHullShader, context, *pModule, pDomainShaderArgs
                                    )) {
     errorOut << llvm::toString(std::move(err));
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   if (shader_info.use_msad || (pGeometryShader && pGeometryShader->shader_info.use_msad))
@@ -2374,8 +2361,7 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
   linkTessellation(*pModule);
   
   if (!runOptimizationPasses(*pModule, errorOut)) {
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   // Serialize AIR
@@ -2404,12 +2390,11 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
   if (ppError) {
     *ppError = nullptr;
   }
-  auto errorObj = new SM50ErrorInternal();
+  auto errorObj = std::make_unique<SM50ErrorInternal>();
   llvm::raw_svector_ostream errorOut(errorObj->buf);
   if (ppBitcode == nullptr) {
     errorOut << "ppBitcode can not be null\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   // pArgs is ignored for now
@@ -2429,8 +2414,7 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
         pVertexShaderArgs
       )) {
     errorOut << llvm::toString(std::move(err));
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   if (shader_info.use_msad)
@@ -2439,8 +2423,7 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
     linkSamplePos(*pModule);
 
   if (!runOptimizationPasses(*pModule, errorOut)) {
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   // Serialize AIR
@@ -2469,12 +2452,11 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
   if (ppError) {
     *ppError = nullptr;
   }
-  auto errorObj = new SM50ErrorInternal();
+  auto errorObj = std::make_unique<SM50ErrorInternal>();
   llvm::raw_svector_ostream errorOut(errorObj->buf);
   if (ppBitcode == nullptr) {
     errorOut << "ppBitcode can not be null\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   // pArgs is ignored for now
@@ -2501,8 +2483,7 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
                                   )
                                 : mullion::dxbc::convert_null_geometry_shader(FunctionName, context, *pModule)) {
     errorOut << llvm::toString(std::move(err));
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   if (shader_info.use_msad)
@@ -2511,8 +2492,7 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
     linkSamplePos(*pModule);
   
   if (!runOptimizationPasses(*pModule, errorOut)) {
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   // Serialize AIR

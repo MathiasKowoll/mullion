@@ -2893,16 +2893,21 @@ GetChromaticity_xy(ColorSyncProfileRef profile, CFStringRef tag, float *out_x, f
   CFDataRef tag_data = ColorSyncProfileCopyTag(profile, tag);
   if (!tag_data)
     return false;
-  if (CFDataGetLength(tag_data) != sizeof(icc_XYZ_t))
+  if (CFDataGetLength(tag_data) != sizeof(icc_XYZ_t)) {
+    CFRelease(tag_data);
     return false;
+  }
   icc_XYZ_t *data = (icc_XYZ_t *)CFDataGetBytePtr(tag_data);
-  if (data->sig != 0x205a5958)
+  if (data->sig != 0x205a5958) {
+    CFRelease(tag_data);
     return false;
+  }
   double X = (int32_t)__builtin_bswap32(data->x) / 65536.0;
   double Y = (int32_t)__builtin_bswap32(data->y) / 65536.0;
   double Z = (int32_t)__builtin_bswap32(data->z) / 65536.0;
   *out_x = X / (X + Y + Z);
   *out_y = Y / (X + Y + Z);
+  CFRelease(tag_data);
   return true;
 }
 
@@ -2939,20 +2944,31 @@ _WMTGetDisplayDescription(void *obj) {
   CGDirectDisplayID display_id = params->handle;
   struct WMTDisplayDescription *desc_out = params->arg.ptr;
   ColorSyncProfileRef profile = ColorSyncProfileCreateWithDisplayID(display_id);
-  if (!profile || !GetDisplayColorGamut(profile, desc_out))
-    GetDisplayColorGamut(ColorSyncProfileCreateWithName(kColorSyncGenericRGBProfile), desc_out);
-  NSScreen *screen = GetNSScreenForDisplayID(display_id);
-  if (screen) {
-    desc_out->maximum_edr_color_component_value = [screen maximumExtendedDynamicRangeColorComponentValue];
-    desc_out->maximum_reference_edr_color_component_value =
-        [screen maximumReferenceExtendedDynamicRangeColorComponentValue];
-    desc_out->maximum_potential_edr_color_component_value =
-        [screen maximumPotentialExtendedDynamicRangeColorComponentValue];
-  } else {
-    desc_out->maximum_edr_color_component_value = 1.0;
-    desc_out->maximum_reference_edr_color_component_value = 0.0;
-    desc_out->maximum_potential_edr_color_component_value = 1.0;
+  ColorSyncProfileRef fallback = NULL;
+  if (!profile || !GetDisplayColorGamut(profile, desc_out)) {
+    fallback = ColorSyncProfileCreateWithName(kColorSyncGenericRGBProfile);
+    if (fallback)
+      GetDisplayColorGamut(fallback, desc_out);
   }
+  // NSScreen's lists and descriptions are autoreleased, and a Wine thread has no pool to drain them
+  @autoreleasepool {
+    NSScreen *screen = GetNSScreenForDisplayID(display_id);
+    if (screen) {
+      desc_out->maximum_edr_color_component_value = [screen maximumExtendedDynamicRangeColorComponentValue];
+      desc_out->maximum_reference_edr_color_component_value =
+          [screen maximumReferenceExtendedDynamicRangeColorComponentValue];
+      desc_out->maximum_potential_edr_color_component_value =
+          [screen maximumPotentialExtendedDynamicRangeColorComponentValue];
+    } else {
+      desc_out->maximum_edr_color_component_value = 1.0;
+      desc_out->maximum_reference_edr_color_component_value = 0.0;
+      desc_out->maximum_potential_edr_color_component_value = 1.0;
+    }
+  }
+  if (profile)
+    CFRelease(profile);
+  if (fallback)
+    CFRelease(fallback);
   return STATUS_SUCCESS;
 }
 
@@ -3054,28 +3070,32 @@ _WMTQueryDisplaySettingForLayer(void *obj) {
   CAMetalLayer *layer = (CAMetalLayer *)params->layer;
   struct WMTHDRMetadata *hdr_metadata_out = params->hdr_metadata.ptr;
 
-  params->version = 0;
-  if (![layer.delegate isKindOfClass:NSView.class])
-    return STATUS_SUCCESS;
+  // the window, its screen and the screen's description are autoreleased, and a Wine thread has no pool to drain
+  // them; this is asked for on every present
+  @autoreleasepool {
+    params->version = 0;
+    if (![layer.delegate isKindOfClass:NSView.class])
+      return STATUS_SUCCESS;
 
-  NSView *view = (NSView *)layer.delegate;
-  if (!view.window)
-    return STATUS_SUCCESS;
+    NSView *view = (NSView *)layer.delegate;
+    if (!view.window)
+      return STATUS_SUCCESS;
 
-  if (!view.window.screen)
-    return STATUS_SUCCESS;
+    if (!view.window.screen)
+      return STATUS_SUCCESS;
 
-  NSScreen *screen = view.window.screen;
-  CGDirectDisplayID id = [[[screen deviceDescription] objectForKey:@"NSScreenNumber"] unsignedIntValue];
+    NSScreen *screen = view.window.screen;
+    CGDirectDisplayID id = [[[screen deviceDescription] objectForKey:@"NSScreenNumber"] unsignedIntValue];
 
-  struct DisplaySetting *setting = &g_display_settings[id == CGMainDisplayID()];
-  *hdr_metadata_out = setting->hdr_metadata;
-  params->version = setting->version;
-  params->colorspace = setting->colorspace;
-  params->edr_value.maximum_edr_color_component_value =
-      layer.wantsExtendedDynamicRangeContent ? screen.maximumExtendedDynamicRangeColorComponentValue : 1.0;
-  params->edr_value.maximum_potential_edr_color_component_value =
-      screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
+    struct DisplaySetting *setting = &g_display_settings[id == CGMainDisplayID()];
+    *hdr_metadata_out = setting->hdr_metadata;
+    params->version = setting->version;
+    params->colorspace = setting->colorspace;
+    params->edr_value.maximum_edr_color_component_value =
+        layer.wantsExtendedDynamicRangeContent ? screen.maximumExtendedDynamicRangeColorComponentValue : 1.0;
+    params->edr_value.maximum_potential_edr_color_component_value =
+        screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
+  }
 
   return STATUS_SUCCESS;
 }
