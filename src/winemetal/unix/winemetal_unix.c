@@ -19,6 +19,7 @@
 #define WINEMETAL_API
 #include "../winemetal_thunks.h"
 #include "../airconv_thunks.h"
+#include "pipeline_cache.h"
 
 typedef int NTSTATUS;
 #define STATUS_SUCCESS 0
@@ -420,6 +421,7 @@ CREATES(_MTLDevice_newLibrary)(void *obj) {
   NSError *err = NULL;
   params->ret_library = (obj_handle_t)[device newLibraryWithData:(dispatch_data_t)params->data error:&err];
   params->ret_error = (obj_handle_t)[err retain];
+  pc_tag_library((id)params->ret_library, (dispatch_data_t)params->data);
   return STATUS_SUCCESS;
 }
 
@@ -429,6 +431,7 @@ CREATES(_MTLLibrary_newFunction)(void *obj) {
   id<MTLLibrary> library = (id<MTLLibrary>)params->handle;
   NSString *name = [[NSString alloc] initWithCString:(char *)params->arg encoding:NSUTF8StringEncoding];
   params->ret = (obj_handle_t)[library newFunctionWithName:name];
+  pc_tag_function((id)params->ret, library, 0, (char *)params->arg, NULL, 0);
   [name release];
   return STATUS_SUCCESS;
 }
@@ -466,8 +469,18 @@ CREATES(_MTLDevice_newComputePipelineState)(void *obj) {
                                                     count:info->num_binary_archives_for_lookup];
   MTLPipelineOption options =
       info->fail_on_binary_archive_miss ? MTLPipelineOptionFailOnBinaryArchiveMiss : MTLPipelineOptionNone;
-  params->ret_pso =
-      (obj_handle_t)[device newComputePipelineStateWithDescriptor:descriptor options:options reflection:nil error:&err];
+  if (!info->num_binary_archives_for_lookup && !info->binary_archive_for_serialization) {
+    id<MTLFunction> functions[1] = {descriptor.computeFunction};
+    params->ret_pso = (obj_handle_t)pc_make(
+        device, descriptor, 'c', functions, 1,
+        ^id(id d, MTLPipelineOption o, NSError **e) {
+          return [device newComputePipelineStateWithDescriptor:d options:o reflection:nil error:e];
+        },
+        ^BOOL(id<MTLBinaryArchive> a, id d, NSError **e) { return [a addComputePipelineFunctionsWithDescriptor:d error:e]; },
+        &err);
+  } else
+    params->ret_pso =
+        (obj_handle_t)[device newComputePipelineStateWithDescriptor:descriptor options:options reflection:nil error:&err];
   params->ret_error = (obj_handle_t)[err retain];
   if (!err && info->binary_archive_for_serialization) {
     [(id<MTLBinaryArchive>)info->binary_archive_for_serialization addComputePipelineFunctionsWithDescriptor:descriptor
@@ -682,10 +695,21 @@ CREATES(_MTLDevice_newRenderPipelineState)(void *obj) {
   NSError *err = NULL;
   MTLPipelineOption options =
       info->fail_on_binary_archive_miss ? MTLPipelineOptionFailOnBinaryArchiveMiss : MTLPipelineOptionNone;
-  params->ret_pso = (obj_handle_t)[(id<MTLDevice>)params->device newRenderPipelineStateWithDescriptor:descriptor
-                                                                                              options:options
-                                                                                           reflection:nil
-                                                                                                error:&err];
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+  if (!info->num_binary_archives_for_lookup && !info->binary_archive_for_serialization) {
+    id<MTLFunction> functions[2] = {descriptor.vertexFunction, descriptor.fragmentFunction};
+    params->ret_pso = (obj_handle_t)pc_make(
+        device, descriptor, 'r', functions, 2,
+        ^id(id d, MTLPipelineOption o, NSError **e) {
+          return [device newRenderPipelineStateWithDescriptor:d options:o reflection:nil error:e];
+        },
+        ^BOOL(id<MTLBinaryArchive> a, id d, NSError **e) { return [a addRenderPipelineFunctionsWithDescriptor:d error:e]; },
+        &err);
+  } else
+    params->ret_pso = (obj_handle_t)[device newRenderPipelineStateWithDescriptor:descriptor
+                                                                         options:options
+                                                                      reflection:nil
+                                                                           error:&err];
   params->ret_error = (obj_handle_t)[err retain];
   if (!err && info->binary_archive_for_serialization) {
     [(id<MTLBinaryArchive>)info->binary_archive_for_serialization addRenderPipelineFunctionsWithDescriptor:descriptor
@@ -786,10 +810,28 @@ CREATES(_MTLDevice_newMeshRenderPipelineState)(void *obj) {
   }
 #endif
   NSError *err = NULL;
-  params->ret_pso = (obj_handle_t)[(id<MTLDevice>)params->device newRenderPipelineStateWithMeshDescriptor:descriptor
-                                                                                                  options:options
-                                                                                               reflection:nil
-                                                                                                    error:&err];
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+  bool cached = !info->num_binary_archives_for_lookup && !info->binary_archive_for_serialization;
+  if (cached) {
+    if (@available(macOS 15, *)) {
+      id<MTLFunction> functions[3] = {descriptor.objectFunction, descriptor.meshFunction, descriptor.fragmentFunction};
+      params->ret_pso = (obj_handle_t)pc_make(
+          device, descriptor, 'm', functions, 3,
+          ^id(id d, MTLPipelineOption o, NSError **e) {
+            return [device newRenderPipelineStateWithMeshDescriptor:d options:o reflection:nil error:e];
+          },
+          ^BOOL(id<MTLBinaryArchive> a, id d, NSError **e) {
+            return [a addMeshRenderPipelineFunctionsWithDescriptor:d error:e];
+          },
+          &err);
+    } else
+      cached = false;
+  }
+  if (!cached)
+    params->ret_pso = (obj_handle_t)[device newRenderPipelineStateWithMeshDescriptor:descriptor
+                                                                             options:options
+                                                                          reflection:nil
+                                                                               error:&err];
   params->ret_error = (obj_handle_t)[err retain];
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
   if (@available(macOS 15, *)) {
@@ -2932,6 +2974,14 @@ CREATES(_MTLLibrary_newFunctionWithConstants)(void *obj) {
 
   params->ret = (obj_handle_t)[library newFunctionWithName:name constantValues:values error:&err];
   params->ret_error = (obj_handle_t)[err retain];
+  /* the constants' values are left out of the tag: Metal matches them in the archives */
+  uint32_t layout[64][2];
+  uint64_t described = params->num_constants < 64 ? params->num_constants : 64;
+  for (uint64_t i = 0; i < described; i++) {
+    layout[i][0] = (uint32_t)constants[i].index;
+    layout[i][1] = (uint32_t)constants[i].type;
+  }
+  pc_tag_function((id)params->ret, library, 1, (char *)params->name.ptr, layout, described * sizeof(layout[0]));
   [name release];
   [values release];
   return STATUS_SUCCESS;
