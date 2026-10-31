@@ -149,6 +149,27 @@ resolve_cache_dir(NSString *path, bool path_is_file) {
       sqlite3_free(errMsg);
     }
 
+    // a converter of another version never reads another version's table, and nothing else removed one: Phantom
+    // Blade Zero's database kept 1.8 GB of version 90 beside version 91. The file shrinks while the new table is
+    // still empty, so the vacuum copies little.
+    NSMutableArray *stale = [NSMutableArray array];
+    sqlite3_stmt *tables = NULL;
+    if (sqlite3_prepare_v2(_db, "SELECT name FROM sqlite_master WHERE type = 'table' AND name GLOB 'cache_*';", -1,
+                           &tables, NULL) == SQLITE_OK) {
+      while (sqlite3_step(tables) == SQLITE_ROW) {
+        NSString *name = [NSString stringWithUTF8String:(const char *)sqlite3_column_text(tables, 0)];
+        if (![name isEqualToString:tableName])
+          [stale addObject:name];
+      }
+      sqlite3_finalize(tables);
+    }
+    for (NSString *name in stale)
+      sqlite3_exec(_db, [NSString stringWithFormat:@"DROP TABLE %@;", name].UTF8String, NULL, NULL, NULL);
+    if (stale.count) {
+      sqlite3_exec(_db, "VACUUM;", NULL, NULL, NULL);
+      NSLog(@"[CacheWriter] Dropped %lu table(s) of other versions from %@", (unsigned long)stale.count, dbPath);
+    }
+
     flock(_lock_fd, LOCK_UN);
 
     NSString *sqlSet = [NSString stringWithFormat:@"INSERT OR REPLACE INTO %@ (key, value) VALUES (?, ?);", tableName];
