@@ -4477,7 +4477,7 @@ API_AVAILABLE(macos(26.0)) @interface MullionMetal4Buffer : NSObject {
   // consistent (MTL4CommandBuffer_orderAliases)
   bool order_aliases;
   double after;
-  // the sample the open compute encoder's last pass ended with
+  // the buffer's last timestamp (metal4_stamp), which the next sampled pass in the same heap starts with
   obj_handle_t stamp_heap;
   uint64_t stamp_index;
   // the buffer's encoders share its tables, whose bindings Metal takes at each draw and dispatch (MTL4ArgumentTable);
@@ -4556,7 +4556,6 @@ API_AVAILABLE(macos(26.0)) metal4_allocators(id<MTL4CommandQueue> queue) {
              afterEncoderStages:MTLStageDispatch | MTLStageBlit | MTLStageAccelerationStructure];
   [state->encoder endEncoding];
   compute = nil;
-  stamp_heap = 0;
 }
 - (void)dealloc {
   dispatch_release(feedback_ready);
@@ -4728,35 +4727,94 @@ _MTL4CommandBuffer_new(void *obj) {
   return STATUS_SUCCESS;
 }
 
+// a timestamp of the command buffer's own, between its encoders, which Metal writes once the work before it in the
+// buffer has completed (MTL4CommandBuffer.h writeTimestampIntoHeap:atIndex:). the timestamps an encoder writes among
+// its commands (writeTimestampWithGranularity:) come early: measured on an M4 Max with macOS 27.2, one written after
+// an 11 ms dispatch or draw read 0.05 to 8 ms after the one before it, either granularity, a barrier before it or not,
+// and one after a copy or a clear's load action read the same as the one before. so a sampled pass ends its encoder, and its time is from the last
+// timestamp the buffer took before it to its own: the passes of a buffer are then timed back to back, all of its time
+// in one pass or another, and work of Mullion's own encoders between two passes goes to the pass after it
 static void
-API_AVAILABLE(macos(26.0)) metal4_begin_samples(
-    MullionMetal4Encoder *state, const struct WMTSampleBufferAttachmentInfo *sample
-) {
-  state->samples = (struct WMTSampleBufferAttachmentInfo){0};
-  if (sample)
-    state->samples = *(const struct WMTSampleBufferAttachmentInfo *)sample;
-  if (state->samples.sample_buffer && state->samples.start_of_encoder_sample_index != MTLCounterDontSample) {
-    uint64_t first = state->samples.start_of_encoder_sample_index;
-    if (state->render) {
-      bool vertex = state->samples.end_of_encoder_sample_index - first + 1 == WMTRenderTimestampSamples;
-      if (vertex)
-        [(id<MTL4RenderCommandEncoder>)state->encoder
-            writeTimestampWithGranularity:MTL4TimestampGranularityPrecise
-                               afterStage:MTLRenderStageVertex
-                                 intoHeap:(id<MTL4CounterHeap>)state->samples.sample_buffer
-                                  atIndex:first];
-      [(id<MTL4RenderCommandEncoder>)state->encoder
-          writeTimestampWithGranularity:MTL4TimestampGranularityPrecise
-                             afterStage:MTLRenderStageFragment
-                               intoHeap:(id<MTL4CounterHeap>)state->samples.sample_buffer
-                                atIndex:vertex ? first + 2 : first];
-    } else {
-      [(id<MTL4ComputeCommandEncoder>)state->encoder
-          writeTimestampWithGranularity:MTL4TimestampGranularityPrecise
-                               intoHeap:(id<MTL4CounterHeap>)state->samples.sample_buffer
-                                atIndex:first];
+API_AVAILABLE(macos(26.0)) metal4_stamp(MullionMetal4Buffer *owner, obj_handle_t heap, uint64_t index) {
+  [owner->buffer writeTimestampIntoHeap:(id<MTL4CounterHeap>)heap atIndex:index];
+  owner->stamp_heap = heap;
+  owner->stamp_index = index;
+}
+
+// what makes a sampled pass wait for the timestamp before it, one of each for a queue: a pipeline of one thread that
+// does nothing and the fence it updates. the buffer's timestamp is GPU work of its own, which nothing else waits
+// for: a pass after it starts as soon as the pass before it ends and, filling the GPU, holds the timestamp back until
+// it ends itself, so that pass reads as nothing and the one before as both. a queue barrier on the pass's encoder
+// does not keep it from starting either. a barrier on an encoder of its own before the timestamp's single thread
+// does, and the pass waits for that thread's fence: measured on an M4 Max with macOS 27.2, two 11 ms dispatches
+// were timed apart by the timestamp between them in 48 of 48 command buffers this way, 45 with the barrier alone
+// and 43 with a fence from the first dispatch's encoder
+@interface MullionMetal4Gate : NSObject {
+@public
+  id<MTLComputePipelineState> pipeline;
+  id<MTLFence> fence;
+}
+@end
+@implementation MullionMetal4Gate
+- (void)dealloc {
+  [pipeline release];
+  [fence release];
+  [super dealloc];
+}
+@end
+
+static MullionMetal4Gate *
+API_AVAILABLE(macos(26.0)) metal4_gate(MullionMetal4Buffer *owner) {
+  static char key;
+  @synchronized(owner->queue) {
+    MullionMetal4Gate *gate = objc_getAssociatedObject(owner->queue, &key);
+    if (gate)
+      return gate->pipeline ? gate : nil;
+    gate = [[[MullionMetal4Gate alloc] init] autorelease];
+    id<MTLLibrary> library = [owner->device newLibraryWithSource:@"kernel void mullion_profile_gate() {}"
+                                                         options:nil
+                                                           error:nil];
+    id<MTLFunction> function = [library newFunctionWithName:@"mullion_profile_gate"];
+    if (function)
+      gate->pipeline = [owner->device newComputePipelineStateWithFunction:function error:nil];
+    gate->fence = [owner->device newFence];
+    if (!gate->fence) {
+      [gate->pipeline release];
+      gate->pipeline = nil;
     }
+    [function release];
+    [library release];
+    objc_setAssociatedObject(owner->queue, &key, gate, OBJC_ASSOCIATION_RETAIN);
+    return gate->pipeline ? gate : nil;
   }
+}
+
+// the samples a pass's encoder takes: its start before the encoder, unless the buffer's last timestamp is in the same
+// heap, which then is the pass's start and is written back for the caller to read; its end as the encoder ends. the
+// fence the pass's encoder then waits for, or nil
+static id<MTLFence>
+API_AVAILABLE(macos(26.0)) metal4_begin_samples(
+    MullionMetal4Buffer *owner, struct WMTSampleBufferAttachmentInfo *sample
+) {
+  if (!sample || !sample->sample_buffer || sample->start_of_encoder_sample_index == MTLCounterDontSample ||
+      owner->feedback.error)
+    return nil;
+  [owner closeCompute];
+  if (sample->sample_buffer == owner->stamp_heap)
+    sample->start_of_encoder_sample_index = owner->stamp_index;
+  else
+    metal4_stamp(owner, sample->sample_buffer, sample->start_of_encoder_sample_index);
+  MullionMetal4Gate *gate = metal4_gate(owner);
+  id<MTL4ComputeCommandEncoder> encoder = gate ? [owner->buffer computeCommandEncoder] : nil;
+  if (!encoder)
+    return nil;
+  [encoder setLabel:@"Mullion profile: after the timestamp"];
+  [encoder barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionNone];
+  [encoder setComputePipelineState:gate->pipeline];
+  [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+  [encoder updateFence:gate->fence afterEncoderStages:MTLStageDispatch];
+  [encoder endEncoding];
+  return gate->fence;
 }
 
 static NTSTATUS
@@ -4767,24 +4825,15 @@ _MTL4CommandBuffer_encoder(void *obj) {
     // a barrier against the queue's earlier work takes an encoder of its own: the open compute encoder ends first
     if (owner->order_aliases)
       [owner closeCompute];
+    struct WMTSampleBufferAttachmentInfo *sample = p->samples.ptr;
+    id<MTLFence> gate = metal4_begin_samples(owner, sample);
     if (p->kind != WMTMetal4Render && owner->compute) {
       MullionMetal4Encoder *state = owner->compute;
       [(id<MTL4ComputeCommandEncoder>)state->encoder
           barrierAfterEncoderStages:[(id<MTL4ComputeCommandEncoder>)state->encoder stages]
                 beforeEncoderStages:MTLStageDispatch | MTLStageBlit | MTLStageAccelerationStructure
                   visibilityOptions:MTL4VisibilityOptionDevice];
-      // the barrier starts this pass where that sample ended the last, and Metal drops a timestamp that follows
-      // another with no work between
-      struct WMTSampleBufferAttachmentInfo *sample = p->samples.ptr, start = {0};
-      if (sample)
-        start = *sample;
-      if (sample && sample->sample_buffer && sample->sample_buffer == owner->stamp_heap &&
-          sample->start_of_encoder_sample_index != MTLCounterDontSample) {
-        start.start_of_encoder_sample_index = MTLCounterDontSample;
-        sample->start_of_encoder_sample_index = owner->stamp_index;
-      }
-      owner->stamp_heap = 0;
-      metal4_begin_samples(state, sample ? &start : NULL);
+      state->samples = sample ? *sample : (struct WMTSampleBufferAttachmentInfo){0};
       p->ret = (obj_handle_t)state;
       return STATUS_SUCCESS;
     }
@@ -4893,7 +4942,15 @@ _MTL4CommandBuffer_encoder(void *obj) {
                                                   visibilityOptions:MTL4VisibilityOptionDevice |
                                                                     MTL4VisibilityOptionResourceAlias];
     }
-    metal4_begin_samples(state, p->samples.ptr);
+    state->samples = sample ? *sample : (struct WMTSampleBufferAttachmentInfo){0};
+    // a sampled pass starts after the timestamp before it (metal4_gate), and so after every pass before it: the
+    // profile's passes run one after another, each timed alone
+    if (gate)
+      [(id<MTL4CommandEncoder>)state->encoder
+                waitForFence:gate
+          beforeEncoderStages:state->render ? MTLStageVertex | MTLStageObject | MTLStageMesh | MTLStageFragment |
+                                                  MTLStageTile
+                                            : MTLStageDispatch | MTLStageBlit | MTLStageAccelerationStructure];
   }
   return STATUS_SUCCESS;
 }
@@ -5031,30 +5088,12 @@ _MTL4CommandEncoder_endEncoding(void *obj) {
     MullionMetal4Encoder *state = (MullionMetal4Encoder *)p->handle;
     if (!state)
       return STATUS_SUCCESS;
-    if (state->samples.sample_buffer) {
-      if (state->render) {
-        if (state->samples.end_of_encoder_sample_index - state->samples.start_of_encoder_sample_index + 1 ==
-            WMTRenderTimestampSamples)
-          [(id<MTL4RenderCommandEncoder>)state->encoder
-              writeTimestampWithGranularity:MTL4TimestampGranularityPrecise
-                                 afterStage:MTLRenderStageVertex
-                                   intoHeap:(id<MTL4CounterHeap>)state->samples.sample_buffer
-                                    atIndex:state->samples.start_of_encoder_sample_index + 1];
-        [(id<MTL4RenderCommandEncoder>)state->encoder
-            writeTimestampWithGranularity:MTL4TimestampGranularityPrecise
-                               afterStage:MTLRenderStageFragment
-                                 intoHeap:(id<MTL4CounterHeap>)state->samples.sample_buffer
-                                  atIndex:state->samples.end_of_encoder_sample_index];
-      } else {
-        [(id<MTL4ComputeCommandEncoder>)state->encoder
-            writeTimestampWithGranularity:MTL4TimestampGranularityPrecise
-                                 intoHeap:(id<MTL4CounterHeap>)state->samples.sample_buffer
-                                  atIndex:state->samples.end_of_encoder_sample_index];
-        state->owner->stamp_heap = state->samples.sample_buffer;
-        state->owner->stamp_index = state->samples.end_of_encoder_sample_index;
-      }
-      state->samples.sample_buffer = 0;
-    }
+    // a sampled pass ends its encoder, a segment of the compute encoder too, for the buffer's timestamp after it
+    obj_handle_t heap = state->samples.sample_buffer;
+    uint64_t index = state->samples.end_of_encoder_sample_index;
+    state->samples.sample_buffer = 0;
+    if (index == MTLCounterDontSample)
+      heap = 0;
     if (state->render) {
       MullionMetal4Buffer *owner = state->owner;
       for (unsigned stage = 0; stage < Metal4ComputeBinding; stage++) {
@@ -5065,8 +5104,10 @@ _MTL4CommandEncoder_endEncoding(void *obj) {
         owner->buffers_set[stage] = owner->textures_set[stage] = 0;
       }
       [state->encoder endEncoding];
-    } else if (!p->arg)
+    } else if (!p->arg || heap)
       [state->owner closeCompute];
+    if (heap)
+      metal4_stamp(state->owner, heap, index);
   }
   return STATUS_SUCCESS;
 }

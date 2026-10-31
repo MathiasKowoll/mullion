@@ -171,8 +171,9 @@ Wine's console output names the file. A process that ends after such a dump adds
 **A slow frame** is profiled with `MULLION_DIAG=profile` and `MULLION_DIAG_PATH`, a macOS directory, and read with
 [`tools/mullion-diag`](../tools/mullion-diag): `mullion-diag report <directory>` lists frame times and where their
 time goes, and `mullion-diag frames <directory>` summarizes the present intervals of each recording. Its own
-description lists what the records do not cover. {logging: one offline report that gathers a run's logs, profiles,
-stacks and shader dumps}.
+description lists what the records do not cover, and how D3D12 passes are timed on Metal 4 and Metal 3;
+[`tests/held.py`](../tests/held.py) checks the profile against workloads whose bounds and passes are known.
+{logging: one offline report that gathers a run's logs, profiles, stacks and shader dumps}.
 
 ## 8. Bisect a regression
 

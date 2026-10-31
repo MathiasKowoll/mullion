@@ -16,6 +16,12 @@ pipeline identities in D3D11 are process-local Metal handles; Tile runs count ti
 indirect vertex/index totals are unavailable.
 calibration records pair Metal's CPU and GPU clocks before and after each command buffer; pass timestamps are
 converted to host nanoseconds with those pairs. older records without calibration retain their nanosecond times.
+D3D12 on Metal 4 times each pass from the command buffer's timestamp before it to its own after it, and a pass starts
+only once that first timestamp is written: a command buffer's passes cover its GPU span back to back and do not
+overlap while profiling, work of Mullion's own encoders between two passes counts in the later one, and each pass
+costs some microseconds of GPU time more. on Metal 3 a pass's stage samples can include its waits and overlap other
+passes, so the passes' sum can exceed the frame's GPU time; gpu_clock is their union. with MULLION_DIAG=profile a D3D12
+compute or copy pass also ends where an application event starts or ends, so each event's dispatches have a pass.
 bridge totals cover the intervals recorded at presents; the trailing frame has no bridge totals.
 buffer records give creation time, Metal handle and length for each successful BufferAllocation creation, including
 heap and sparse buffers. resource_buffers counts these events in their creation frame, including the trailing one;
