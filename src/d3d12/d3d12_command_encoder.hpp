@@ -19,6 +19,7 @@
 #pragma once
 
 #include "mullion_texture.hpp"
+#include "mullion_scaler.hpp"
 #include <cstdint>
 
 namespace mullion {
@@ -37,6 +38,8 @@ enum class EncoderType {
   Settle,
   ComputeParts,
   AccelerationStructure,
+  // MetalFX's temporal scaler (IMTLD3D12CommandListExt::TemporalUpscale)
+  TemporalUpscale,
 };
 
 class MTLD3D12QueryHeap;
@@ -184,6 +187,13 @@ struct AccelerationStructureEncoderData : EncoderData {
 struct ResolveEncoderData : EncoderData {
   TextureViewRef src;
   TextureViewRef dst;
+};
+
+// a temporal upscale, ordered after all the work before it and before all the work after (MTLD3D12CommandQueue)
+struct TemporalUpscaleEncoderData : EncoderData {
+  Rc<TemporalScaler> scaler;
+  TextureViewRef color, output, depth, motion, exposure;
+  WMTFXTemporalScalerProps props;
 };
 
 // the passes up to `end` are left out when the predication region's kernel wrote that it skips

@@ -566,7 +566,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     // MULLION_D3D12_GPU_ERRORS: the passes with indirect commands and where their resolvers keep their largest numbers
     std::vector<std::pair<std::string, const RenderEncoderData::Most *>> most{};
     // how many encoders of each kind it has, and whether it presents: what a report of one that does not complete says
-    std::array<uint16_t, size_t(EncoderType::AccelerationStructure) + 1> encoders{};
+    std::array<uint16_t, size_t(EncoderType::TemporalUpscale) + 1> encoders{};
     bool presents = false;
     diag::DebugGroups groups{};
     std::array<uint32_t, WMTMetal4AccelerationStructure + 1> physical{};
@@ -1520,6 +1520,42 @@ public:
             encoder.endSegment();
           else
             encoder.endEncoding();
+          break;
+        }
+        case EncoderType::TemporalUpscale: {
+          // MetalFX encodes encoders of its own, which wait for the scaler's fence and update it: an encoder ahead
+          // of them waits for all the work before and updates that fence, one after them waits for it and updates
+          // fence_, which all the work after waits for. no pass overlaps the upscale
+          auto data = static_cast<TemporalUpscaleEncoderData *>(current);
+          PassSync all;
+          WaitAll([&](WMT::Fence fence) { all.waits[all.wait_count++] = fence; });
+          auto fence = data->scaler->fence();
+          if constexpr (Metal4) {
+            cmdbuf.encodeTemporalScale(
+                data->scaler->scaler(), data->color.texture(), data->output.texture(), data->depth.texture(),
+                data->motion.texture(), data->exposure.texture(), fence, data->props, all.waits, all.wait_count
+            );
+            // its first encoder began with the aliasing barrier the queue carried (OrderAliases)
+            order_aliases_ = false;
+          } else {
+            auto begin = cmdbuf.blitCommandEncoder();
+            begin.setLabel(WMT::String::string("BeginScaler", WMTUTF8StringEncoding));
+            for (unsigned i = 0; i < all.wait_count; i++)
+              begin.waitForFence(all.waits[i]);
+            begin.updateFence(fence);
+            begin.endEncoding();
+            cmdbuf.encodeTemporalScale(
+                data->scaler->scaler(), data->color.texture(), data->output.texture(), data->depth.texture(),
+                data->motion.texture(), data->exposure.texture(), fence, data->props
+            );
+            auto end = cmdbuf.blitCommandEncoder();
+            end.setLabel(WMT::String::string("EndScaler", WMTUTF8StringEncoding));
+            end.waitForFence(fence);
+            end.updateFence(fence_);
+            end.endEncoding();
+          }
+          if (diag::trace_encoders)
+            scope.inflight->physical[Metal4 ? WMTMetal4Compute : WMTMetal4Blit] += 2;
           break;
         }
         case EncoderType::Settle:

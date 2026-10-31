@@ -19,6 +19,8 @@
 #include <functional>
 #include "d3d12_command_allocator.hpp"
 #include "d3d12_acceleration_structure.hpp"
+#include "d3d12_interfaces.hpp"
+#include "com/com_object.hpp"
 #include "airconv_ray.h"
 #include "com/com_pointer.hpp"
 #include "mullion_format.hpp"
@@ -115,6 +117,88 @@ to_metal_primitive_type(D3D12_PRIMITIVE_TOPOLOGY topo, WMTPrimitiveType &primiti
     return false;
   }
   return true;
+}
+
+// the MetalFX temporal scalers of one upscale feature (IMTLD3D12CommandListExt::CreateTemporalUpscaler): one for each
+// configuration it was used in, whose history the next upscale in it continues
+class MTLD3D12TemporalUpscaler final : public ComObject<IMTLD3D12TemporalUpscaler> {
+public:
+  struct Scaler {
+    WMTPixelFormat color, output, depth, motion;
+    bool auto_exposure;
+    uint32_t input_width, input_height, output_width, output_height;
+    Rc<TemporalScaler> scaler;
+    // display-resolution motion vectors, downscaled to the input's size (cs_downscale_dilated_mv)
+    Rc<Texture> motion_downscaled;
+  };
+  // a feature's configuration changes when its application resizes the frame, which recreates the feature: the last few
+  // are kept, and an upscale recorded with an older one keeps that scaler until it has run
+  static constexpr size_t kKept = 4;
+  std::vector<Scaler> scalers;
+  mullion::mutex mutex;
+
+  HRESULT STDMETHODCALLTYPE
+  QueryInterface(REFIID riid, void **ppvObject) final {
+    if (!ppvObject)
+      return E_POINTER;
+    *ppvObject = nullptr;
+    if (riid == __uuidof(IUnknown) || riid == __uuidof(IMTLD3D12TemporalUpscaler)) {
+      *ppvObject = ref(this);
+      return S_OK;
+    }
+    return E_NOINTERFACE;
+  }
+};
+
+// a format MetalFX takes for a texture of `format`, read through a view of the same layout: a typeless resource's
+// texture is of an integer format (MTLQueryDXGIFormat), whose values are the bits of the float or normalized ones its
+// views wrote. invalid when there is none
+static WMTPixelFormat
+TemporalUpscaleFormat(WMTPixelFormat format, bool motion) {
+  if (motion) {
+    // MetalFX's motion formats (MTLFXTemporalScalerDescriptor motionTextureFormat), as D3D11's context takes them
+    switch (format) {
+    case WMTPixelFormatRG16Uint:
+    case WMTPixelFormatRG16Float:
+    case WMTPixelFormatRG16Sint:
+    case WMTPixelFormatRG16Snorm:
+    case WMTPixelFormatRG16Unorm:
+      return WMTPixelFormatRG16Float;
+    case WMTPixelFormatRG32Uint:
+    case WMTPixelFormatRG32Float:
+    case WMTPixelFormatRG32Sint:
+      return WMTPixelFormatRG32Float;
+    case WMTPixelFormatRGBA16Sint:
+    case WMTPixelFormatRGBA16Snorm:
+    case WMTPixelFormatRGBA16Uint:
+    case WMTPixelFormatRGBA16Unorm:
+    case WMTPixelFormatRGBA16Float:
+      return WMTPixelFormatRGBA16Float;
+    default:
+      return WMTPixelFormatInvalid;
+    }
+  }
+  switch (format) {
+  case WMTPixelFormatR32Uint:
+  case WMTPixelFormatR32Sint:
+    return WMTPixelFormatR32Float;
+  case WMTPixelFormatR16Uint:
+  case WMTPixelFormatR16Sint:
+    return WMTPixelFormatR16Float;
+  case WMTPixelFormatRGBA8Uint:
+  case WMTPixelFormatRGBA8Sint:
+    return WMTPixelFormatRGBA8Unorm;
+  case WMTPixelFormatRGB10A2Uint:
+    return WMTPixelFormatRGB10A2Unorm;
+  case WMTPixelFormatRGBA16Uint:
+  case WMTPixelFormatRGBA16Sint:
+    return WMTPixelFormatRGBA16Float;
+  case WMTPixelFormatRGBA32Uint:
+  case WMTPixelFormatRGBA32Sint:
+    return WMTPixelFormatRGBA32Float;
+  default:
+    return format;
+  }
 }
 
 // `Graphics`CommandList is a really confusing name
@@ -812,6 +896,11 @@ public:
         riid == __uuidof(ID3D12GraphicsCommandList7) || riid == __uuidof(ID3D12GraphicsCommandList8) ||
         riid == __uuidof(ID3D12GraphicsCommandList9)) {
       *ppvObject = ref(this);
+      return S_OK;
+    }
+
+    if (riid == __uuidof(IMTLD3D12CommandListExt)) {
+      *ppvObject = ref(&upscale_ext_);
       return S_OK;
     }
 
@@ -4873,6 +4962,226 @@ public:
           return;
       }
   }
+
+  // MetalFX's temporal scaler, which nvngx's DLSS records here
+  BOOL
+  TemporalUpscaleSupported(FLOAT *max_scale) {
+    auto scales = device_->GetMTLDevice().temporalScalerScales();
+    if (max_scale)
+      *max_scale = scales.max;
+    return scales.max > 0;
+  }
+
+  HRESULT
+  TemporalUpscale(IMTLD3D12TemporalUpscaler *pUpscaler, const MTL_TEMPORAL_UPSCALE_D3D12_DESC *pDesc) {
+    if (!pUpscaler || !pDesc || Bundled())
+      return E_INVALIDARG;
+    auto resource = [](ID3D12Resource *resource) {
+      auto texture = resource ? static_cast<MTLD3D12Resource *>(resource)->texture.ptr() : nullptr;
+      return Rc<Texture>(texture);
+    };
+    Rc<Texture> color = resource(pDesc->Color), output = resource(pDesc->Output), depth = resource(pDesc->Depth),
+                motion = resource(pDesc->MotionVector), exposure = resource(pDesc->ExposureTexture);
+    if (!color || !output || !depth || !motion || (pDesc->ExposureTexture && !exposure)) {
+      ERR("TemporalUpscale: a resource that is no texture");
+      return E_INVALIDARG;
+    }
+    // each texture is read, and the output written, through a view of its first level and slice in a format MetalFX
+    // takes; one in another format than its texture's needs the texture's format views
+    WMTPixelFormat formats[5];
+    TextureViewRef views[5];
+    Rc<Texture> *textures[5] = {&color, &output, &depth, &motion, &exposure};
+    for (unsigned i = 0; i < 5; i++) {
+      auto &texture = *textures[i];
+      if (!texture)
+        continue;
+      auto format = TemporalUpscaleFormat(texture->pixelFormat(), i == 3);
+      if (format == WMTPixelFormatInvalid ||
+          (format != texture->pixelFormat() && !(texture->usage() & WMTTextureUsagePixelFormatView))) {
+        ERR("TemporalUpscale: MetalFX takes no texture of format ", texture->pixelFormat());
+        return E_INVALIDARG;
+      }
+      formats[i] = format;
+      views[i] = texture->view(texture->createView(
+          {.format = format,
+           .type = WMTTextureType2D,
+           .firstMiplevel = 0,
+           .miplevelCount = 1,
+           .firstArraySlice = 0,
+           .arraySize = 1}
+      ));
+    }
+
+    WMTFXTemporalScalerProps props{
+        pDesc->InputContentWidth ? pDesc->InputContentWidth : color->width(),
+        pDesc->InputContentHeight ? pDesc->InputContentHeight : color->height(),
+        (bool)pDesc->InReset,
+        (bool)pDesc->DepthReversed,
+        pDesc->MotionVectorScaleX,
+        pDesc->MotionVectorScaleY,
+        pDesc->JitterOffsetX,
+        pDesc->JitterOffsetY,
+        pDesc->PreExposure,
+    };
+    // MetalFX takes input content from the output's size over its largest scale up to the color texture's size: nvngx
+    // asks for render sizes in that range (DLSS's optimal settings), and one outside is brought into it
+    FLOAT max_scale = 0;
+    if (!TemporalUpscaleSupported(&max_scale))
+      return E_NOTIMPL;
+    auto least = [&](uint32_t out) { return (uint32_t)std::ceil(out / max_scale); };
+    auto width = std::clamp(props.input_content_width, std::min(least(output->width()), color->width()), color->width());
+    auto height =
+        std::clamp(props.input_content_height, std::min(least(output->height()), color->height()), color->height());
+    if (width != props.input_content_width || height != props.input_content_height)
+      WARN("TemporalUpscale: input content ", props.input_content_width, "x", props.input_content_height, " for ",
+           output->width(), "x", output->height(), " is outside what MetalFX takes; upscaling ", width, "x", height);
+    props.input_content_width = width;
+    props.input_content_height = height;
+
+    auto upscaler = static_cast<MTLD3D12TemporalUpscaler *>(pUpscaler);
+    Rc<TemporalScaler> scaler;
+    Rc<Texture> motion_downscaled;
+    {
+      std::lock_guard<mullion::mutex> lock(upscaler->mutex);
+      auto &scalers = upscaler->scalers;
+      auto found = std::ranges::find_if(scalers, [&](auto &entry) {
+        return entry.color == formats[0] && entry.output == formats[1] && entry.depth == formats[2] &&
+               entry.motion == formats[3] && entry.auto_exposure == bool(pDesc->AutoExposure) &&
+               entry.input_width == color->width() && entry.input_height == color->height() &&
+               entry.output_width == output->width() && entry.output_height == output->height() &&
+               bool(entry.motion_downscaled) == bool(pDesc->MotionVectorInDisplayRes);
+      });
+      if (found == scalers.end()) {
+        WMTFXTemporalScalerInfo info{};
+        info.color_format = formats[0];
+        info.output_format = formats[1];
+        info.depth_format = formats[2];
+        info.motion_format = pDesc->MotionVectorInDisplayRes ? WMTPixelFormatRG32Float : formats[3];
+        info.input_width = color->width();
+        info.input_height = color->height();
+        info.output_width = output->width();
+        info.output_height = output->height();
+        info.input_content_properties_enabled = true;
+        info.input_content_min_scale = 1.0f;
+        info.input_content_max_scale = max_scale;
+        info.auto_exposure = pDesc->AutoExposure;
+        info.requires_synchronous_initialization = true;
+        auto made = Rc(new TemporalScaler(device_->GetMTLDevice(), info, device_->UsesMetal4()));
+        if (!made->scaler() || !made->fence()) {
+          ERR("TemporalUpscale: MetalFX made no scaler of ", info.input_width, "x", info.input_height, " to ",
+              info.output_width, "x", info.output_height, ", formats ", info.color_format, " ", info.output_format,
+              " ", info.depth_format, " ", info.motion_format);
+          return E_FAIL;
+        }
+        Rc<Texture> downscaled;
+        if (pDesc->MotionVectorInDisplayRes) {
+          WMTTextureInfo tex_info{};
+          tex_info.width = info.input_width;
+          tex_info.height = info.input_height;
+          tex_info.depth = 1;
+          tex_info.array_length = 1;
+          tex_info.mipmap_level_count = 1;
+          tex_info.pixel_format = WMTPixelFormatRG32Float;
+          tex_info.sample_count = 1;
+          tex_info.type = WMTTextureType2D;
+          tex_info.usage = WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite;
+          tex_info.options = WMTResourceStorageModePrivate | WMTResourceHazardTrackingModeUntracked;
+          downscaled = new Texture(tex_info, device_->GetMTLDevice());
+          Flags<TextureAllocationFlag> flags;
+          flags.set(TextureAllocationFlag::GpuPrivate);
+          downscaled->rename(downscaled->allocate(flags));
+        }
+        if (scalers.size() == MTLD3D12TemporalUpscaler::kKept)
+          scalers.erase(scalers.begin());
+        found = scalers.insert(
+            scalers.end(), {formats[0], formats[1], formats[2], formats[3], bool(pDesc->AutoExposure), info.input_width,
+                            info.input_height, info.output_width, info.output_height, made, downscaled}
+        );
+      }
+      scaler = found->scaler;
+      motion_downscaled = found->motion_downscaled;
+    }
+
+    PredicatedPasses predicated(this);
+    for (auto texture : textures)
+      if (*texture)
+        UsedTexture(texture->ptr());
+    OrderingPoint();
+    allocator_->InvalidateCurrentPass();
+    TextureViewRef motion_view = views[3];
+    if (motion_downscaled) {
+      // display-resolution motion vectors are scaled to the input's pixels and size first, as D3D11's are
+      // (MTLFXMVScaleContext), and MetalFX scales them no more
+      SimpleCommandContext<MTLD3D12CommandAllocatorImpl> ctx{*allocator_.ptr()};
+      auto pso = ctx.getComputePipeline("cs_downscale_dilated_mv");
+      if (!pso)
+        return E_FAIL;
+      ctx.startComputePass();
+      ctx.setComputePSO(pso, {8, 4, 1});
+      ctx.setComputeTexture(0, motion, views[3]->key, 0);
+      ctx.setComputeTexture(1, motion_downscaled, motion_downscaled->fullView, 0);
+      float scale[2] = {props.motion_vector_scale_x, props.motion_vector_scale_y};
+      memcpy(ctx.setComputeBytes(0, sizeof(scale)), scale, sizeof(scale));
+      ctx.dispatch({motion_downscaled->width(), motion_downscaled->height(), 1});
+      ctx.endPass();
+      motion_view = motion_downscaled->view(motion_downscaled->fullView);
+      props.motion_vector_scale_x = props.motion_vector_scale_y = 1.0f;
+    }
+    auto pass = allocator_->AllocatePass<TemporalUpscaleEncoderData>();
+    pass->type = EncoderType::TemporalUpscale;
+    pass->scaler = std::move(scaler);
+    pass->color = views[0];
+    pass->output = views[1];
+    pass->depth = views[2];
+    pass->motion = motion_view;
+    pass->exposure = views[4];
+    pass->props = props;
+    allocator_->InvalidateCurrentPass();
+    OrderingPoint();
+    return S_OK;
+  }
+
+  // the list's IMTLD3D12CommandListExt, whose references are the list's, as D3D11's context extension is
+  class UpscaleExt final : public IMTLD3D12CommandListExt {
+    MTLD3D12GraphicsCommandListImpl *list_;
+
+  public:
+    UpscaleExt(MTLD3D12GraphicsCommandListImpl *list) : list_(list) {}
+
+    HRESULT STDMETHODCALLTYPE
+    QueryInterface(REFIID riid, void **ppvObject) final {
+      return list_->QueryInterface(riid, ppvObject);
+    }
+    ULONG STDMETHODCALLTYPE
+    AddRef() final {
+      return list_->AddRef();
+    }
+    ULONG STDMETHODCALLTYPE
+    Release() final {
+      return list_->Release();
+    }
+
+    HRESULT STDMETHODCALLTYPE
+    GetTemporalUpscaleSupport(BOOL *pSupported, FLOAT *pMaxScale) final {
+      if (!pSupported)
+        return E_INVALIDARG;
+      *pSupported = list_->TemporalUpscaleSupported(pMaxScale);
+      return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE
+    CreateTemporalUpscaler(IMTLD3D12TemporalUpscaler **ppUpscaler) final {
+      if (!ppUpscaler)
+        return E_INVALIDARG;
+      *ppUpscaler = ref(new MTLD3D12TemporalUpscaler());
+      return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE
+    TemporalUpscale(IMTLD3D12TemporalUpscaler *pUpscaler, const MTL_TEMPORAL_UPSCALE_D3D12_DESC *pDesc) final {
+      return list_->TemporalUpscale(pUpscaler, pDesc);
+    }
+  } upscale_ext_{this};
 };
 
 HRESULT STDMETHODCALLTYPE

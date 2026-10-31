@@ -208,6 +208,9 @@ MTLD3D12CommandAllocatorImpl::Discard(EncoderData *Root) {
     case EncoderType::ResolveTimestamps:
       reinterpret_cast<ResolveTimestampsData *>(pass)->~ResolveTimestampsData();
       break;
+    case EncoderType::TemporalUpscale:
+      reinterpret_cast<TemporalUpscaleEncoderData *>(pass)->~TemporalUpscaleEncoderData();
+      break;
     }
     pass = next;
   }
