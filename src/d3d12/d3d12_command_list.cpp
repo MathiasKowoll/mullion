@@ -3629,6 +3629,7 @@ public:
     auto bytes = static_cast<const char *>(data);
     if (Record([=, blob = std::vector<char>(bytes, bytes + size)](auto *l) { l->BeginEvent(Metadata, blob.data(), size); }))
       return;
+    EventBoundary();
     std::string path = events_.empty() ? "" : events_.back();
     diag::PushEvent(path, diag::EventName(Metadata, data, size));
     auto copy = static_cast<char *>(allocator_->AllocateCPUHeap(path.size() + 1, 1));
@@ -3639,6 +3640,7 @@ public:
   EndEvent() {
     if (!diag::events || Record([](auto *l) { l->EndEvent(); }) || events_.empty())
       return;
+    EventBoundary();
     events_.pop_back();
     allocator_->event = events_.empty() ? nullptr : events_.back();
   };
@@ -3646,6 +3648,17 @@ public:
   // the paths of the open events, in the allocator's memory as the passes that carry them are; a pass that goes on
   // past an event's start or end keeps the path it began in
   std::vector<const char *> events_;
+
+  // with MULLION_DIAG=profile a compute or copy pass ends where an event starts or ends, so each event's dispatches
+  // and copies are timed apart from the next one's, as an engine's GPU profiler times its passes: an engine's compute
+  // passes, which only barriers separate, would otherwise run together as one pass of the first event. a render pass
+  // goes on, as ending it would store and load its attachments
+  void
+  EventBoundary() {
+    auto open = allocator_->encoder_current;
+    if (diag::profile && open && (open->type == EncoderType::Compute || open->type == EncoderType::Blit))
+      allocator_->InvalidateCurrentPass();
+  }
 
   void STDMETHODCALLTYPE ExecuteIndirect(
       ID3D12CommandSignature *pCommandSignature, UINT MaxCommandCount, ID3D12Resource *pArgBuffer,

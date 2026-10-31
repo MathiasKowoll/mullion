@@ -12,6 +12,12 @@ is among the bridge calls that took it longest.
 events: each frame draws in the application's events "frame" and, inside it, "draw <frame>", which D3D12 gives in
 every encoding PIX has; the tool names each frame's draw by that path.
 
+passes (tests/d3d12/d3d12_passes.cpp): frames of hundreds of passes, compute, copies and draws in events of their
+own, and of compute passes that only UAV barriers separate ("chained"); each pass of a frame's command buffer has a
+GPU time, and together they cover the command buffer's own GPU span (gpuStartTime to gpuEndTime, which no counter
+gives), as a sum on Metal 4, whose passes the profile times back to back, and as a union on Metal 3, whose stages
+overlap. a chained frame has a pass for each dispatch's event.
+
 the first frame is not judged: it has no frame before it to start from (mullion-diag, bounds).
 """
 import argparse
@@ -31,6 +37,32 @@ loader.exec_module(tool)
 # the programs, and the arguments that pick a front end before the mode
 PROGRAMS = {"d3d12_held": ["dxil"], "d3d11_held": []}
 MODES = ("gpu", "app", "hitch", "events")
+# the passes workloads: their arguments after the front end, and how much of a command buffer's GPU span the passes
+# may miss or count twice
+PASSES = {"passes": ["48", "120", "mixed"], "chained": ["48", "120", "chained"]}
+SPAN = 0.02
+
+
+def judge_passes(facts, record, metal4):
+    """the passes' GPU times against the command buffers' own spans, one line for each thing wrong"""
+    compute, copies, draws = facts["passes"][0], facts["passes"][1], facts["passes"][2]
+    by = {}
+    for p in record.passes:
+        by.setdefault((p.queue, p.cmdbuf), []).append(p)
+    frames = sorted(((times[2], times[3], by[key]) for key, times in record.cmdbufs.items()
+                     if len(by.get(key, [])) >= compute), key=lambda frame: frame[0])[1:]
+    wrong = [] if frames else ["no command buffer has the frame's passes"]
+    for n, (start, end, passes) in enumerate(frames, 1):
+        kinds = {kind: sum(p.kind == kind for p in passes) for kind in ("Compute", "Blit", "Render")}
+        missing = [p.number for p in passes if not p.stages or p.gpu <= 0]
+        total = sum(p.gpu for p in passes) if metal4 else tool.union(s for p in passes for s in p.stages)
+        if kinds["Compute"] != compute or kinds["Render"] != draws or kinds["Blit"] < copies:
+            wrong.append(f"frame {n}: passes {kinds}, the program made {compute} dispatches, {copies} copies, {draws} draws")
+        if missing:
+            wrong.append(f"frame {n}: {len(missing)} of {len(passes)} passes have no GPU time, the first {missing[0]}")
+        if abs(total - (end - start)) > SPAN * (end - start):
+            wrong.append(f"frame {n}: the passes cover {total} ns of the command buffer's {end - start} ns")
+    return wrong
 
 
 def judge(mode, facts, record):
@@ -98,6 +130,23 @@ def main():
                 failed += bool(wrong)
                 print(f"{program} {mode}: {'failed' if wrong else 'passed'}", *(f"  {line}" for line in wrong[:8]),
                       sep="\n", flush=True)
+        exe = next(path for build in builds for path in build.glob("tests/*/d3d12_passes.exe"))
+        for mode, arguments in PASSES.items():
+            out = (args.out / f"d3d12_passes.{mode}").resolve()
+            shutil.rmtree(out, ignore_errors=True)
+            out.mkdir(parents=True)
+            env = dict(base, MULLION_DIAG="profile", MULLION_DIAG_PATH=str(out))
+            status = run.finish([binary, exe, "dxil", *arguments], env, args.seconds, out / "log.txt")
+            facts = {}
+            for kind, rest in re.findall(r"^fact (\w+) (.*)$", (out / "log.txt").read_text(errors="replace"), re.M):
+                facts[kind] = [int(word) for word in rest.split()]
+            records = sorted(out.glob("*.diag"))
+            wrong = ([f"exit status {status}"] if status else []) + (
+                judge_passes(facts, tool.Record(records[-1]), not args.family.endswith("-metal3"))
+                if len(records) == 1 else [f"{len(records)} records"])
+            failed += bool(wrong)
+            print(f"d3d12_passes {mode}: {'failed' if wrong else 'passed'}", *(f"  {line}" for line in wrong[:8]),
+                  sep="\n", flush=True)
         sys.exit(failed != 0)
 
 
