@@ -3040,28 +3040,32 @@ _WMTQueryDisplaySettingForLayer(void *obj) {
   CAMetalLayer *layer = (CAMetalLayer *)params->layer;
   struct WMTHDRMetadata *hdr_metadata_out = params->hdr_metadata.ptr;
 
-  params->version = 0;
-  if (![layer.delegate isKindOfClass:NSView.class])
-    return STATUS_SUCCESS;
+  // the window, its screen and the screen's description are autoreleased, and a Wine thread has no pool to drain
+  // them; this is asked for on every present
+  @autoreleasepool {
+    params->version = 0;
+    if (![layer.delegate isKindOfClass:NSView.class])
+      return STATUS_SUCCESS;
 
-  NSView *view = (NSView *)layer.delegate;
-  if (!view.window)
-    return STATUS_SUCCESS;
+    NSView *view = (NSView *)layer.delegate;
+    if (!view.window)
+      return STATUS_SUCCESS;
 
-  if (!view.window.screen)
-    return STATUS_SUCCESS;
+    if (!view.window.screen)
+      return STATUS_SUCCESS;
 
-  NSScreen *screen = view.window.screen;
-  CGDirectDisplayID id = [[[screen deviceDescription] objectForKey:@"NSScreenNumber"] unsignedIntValue];
+    NSScreen *screen = view.window.screen;
+    CGDirectDisplayID id = [[[screen deviceDescription] objectForKey:@"NSScreenNumber"] unsignedIntValue];
 
-  struct DisplaySetting *setting = &g_display_settings[id == CGMainDisplayID()];
-  *hdr_metadata_out = setting->hdr_metadata;
-  params->version = setting->version;
-  params->colorspace = setting->colorspace;
-  params->edr_value.maximum_edr_color_component_value =
-      layer.wantsExtendedDynamicRangeContent ? screen.maximumExtendedDynamicRangeColorComponentValue : 1.0;
-  params->edr_value.maximum_potential_edr_color_component_value =
-      screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
+    struct DisplaySetting *setting = &g_display_settings[id == CGMainDisplayID()];
+    *hdr_metadata_out = setting->hdr_metadata;
+    params->version = setting->version;
+    params->colorspace = setting->colorspace;
+    params->edr_value.maximum_edr_color_component_value =
+        layer.wantsExtendedDynamicRangeContent ? screen.maximumExtendedDynamicRangeColorComponentValue : 1.0;
+    params->edr_value.maximum_potential_edr_color_component_value =
+        screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
+  }
 
   return STATUS_SUCCESS;
 }
