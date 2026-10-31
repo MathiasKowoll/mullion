@@ -20,6 +20,13 @@
  * pipeline in the archives, so a key several pipelines share costs only another
  * file to open. What is written stops at MULLION_PIPELINE_CACHE_MAX_MB (4096).
  * MULLION_PIPELINE_CACHE=0 turns it off.
+ *
+ * Adding a pipeline to an archive makes a gpuarchiver-* folder of about 380 KB in
+ * Metal's shader cache, which serializing reads and nothing ever removes: a run of
+ * PBZ left 68,000 of them, 30 GB. Loading a written archive makes none. An archive is
+ * in flight from before its add until it is let go, and a sweep removes the folders
+ * made before the oldest archive in flight: at start, every 16 archives kept, and at
+ * exit. Mullion makes no other archive.
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -31,6 +38,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <dirent.h>
 #include <unistd.h>
 #include "pipeline_cache.h"
 
@@ -47,6 +57,73 @@ static atomic_uint written;
 static atomic_ullong hits, misses, unkeyed, opened, kept_failed, kept_bytes, kept_count, over_cap;
 static uint64_t cap_bytes;
 static int keep_air; /* MULLION_PIPELINE_CACHE_AIR=1 keeps the functions' AIR in each archive */
+static NSString *metal_cache;              /* where Metal makes its gpuarchiver-* folders */
+static pthread_mutex_t flight_mutex = PTHREAD_MUTEX_INITIALIZER;
+static NSMutableArray *in_flight;          /* start times of the archives in flight; under flight_mutex */
+static pthread_mutex_t sweep_mutex = PTHREAD_MUTEX_INITIALIZER;
+static atomic_ullong swept, let_go;
+
+static double
+now(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_REALTIME, &t);
+  return t.tv_sec + t.tv_nsec / 1e9;
+}
+
+static NSNumber *
+begin_flight(void) {
+  NSNumber *start = [[NSNumber alloc] initWithDouble:now()];
+  pthread_mutex_lock(&flight_mutex);
+  [in_flight addObject:start];
+  pthread_mutex_unlock(&flight_mutex);
+  return start;
+}
+
+static void
+end_flight(NSNumber *start) {
+  pthread_mutex_lock(&flight_mutex);
+  NSUInteger at = [in_flight indexOfObjectIdenticalTo:start];
+  if (at != NSNotFound)
+    [in_flight removeObjectAtIndex:at];
+  pthread_mutex_unlock(&flight_mutex);
+  [start release];
+}
+
+/* Removes the gpuarchiver-* folders made before the oldest archive in flight. An archive's
+ * folder is made after it is put in flight, so a folder older than the cutoff, taken with
+ * the list held, is not one an archive in flight still needs. */
+static void
+sweep(void) {
+  if (!metal_cache || pthread_mutex_trylock(&sweep_mutex))
+    return;
+  @autoreleasepool {
+    pthread_mutex_lock(&flight_mutex);
+    double cutoff = now();
+    for (NSNumber *start in in_flight)
+      cutoff = MIN(cutoff, start.doubleValue);
+    pthread_mutex_unlock(&flight_mutex);
+    DIR *folder = opendir(metal_cache.fileSystemRepresentation);
+    struct dirent *entry;
+    unsigned long long removed = 0;
+    while (folder && (entry = readdir(folder))) {
+      if (strncmp(entry->d_name, "gpuarchiver-", 12))
+        continue;
+      NSString *path = [metal_cache stringByAppendingPathComponent:@(entry->d_name)];
+      struct stat info;
+      if (lstat(path.fileSystemRepresentation, &info) || !S_ISDIR(info.st_mode) ||
+          info.st_birthtimespec.tv_sec + info.st_birthtimespec.tv_nsec / 1e9 >= cutoff)
+        continue;
+      if ([[NSFileManager defaultManager] removeItemAtPath:path error:nil])
+        removed++;
+    }
+    if (folder)
+      closedir(folder);
+    if (removed && !atomic_fetch_add(&swept, removed))
+      fprintf(stderr, "mullion: pipeline cache: removed %llu gpuarchiver folders Metal left in %s\n", removed,
+              metal_cache.UTF8String);
+  }
+  pthread_mutex_unlock(&sweep_mutex);
+}
 
 static NSString *
 sanitized(NSString *text) {
@@ -59,12 +136,14 @@ report(void) {
   if (!directory)
     return;
   dispatch_group_wait(keep_group, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
+  sweep();
   fprintf(stderr,
           "mullion: pipeline cache: %llu found, %llu compiled, %llu kept (%.1f MB, %.0f KB each), %llu not kept over the "
-          "%llu MB cap, %llu not keyed, %llu archives opened\n",
+          "%llu MB cap, %llu not keyed, %llu archives opened, %llu gpuarchiver folders removed\n",
           (unsigned long long)hits, (unsigned long long)misses, (unsigned long long)kept_count, kept_bytes / 1e6,
           kept_count ? kept_bytes / 1e3 / kept_count : 0.0, (unsigned long long)over_cap,
-          (unsigned long long)(cap_bytes >> 20), (unsigned long long)unkeyed, (unsigned long long)opened);
+          (unsigned long long)(cap_bytes >> 20), (unsigned long long)unkeyed, (unsigned long long)opened,
+          (unsigned long long)swept);
 }
 
 /* The folder, beside the one Mullion gave Metal's cache, and what is in it. */
@@ -75,8 +154,10 @@ setup(void) {
     return;
   @autoreleasepool {
     NSString *base = MTLGetShaderCachePath();
-    if (base.length)
+    if (base.length) {
+      metal_cache = [base copy];
       base = [base stringByDeletingLastPathComponent];
+    }
     else {
       char buf[PATH_MAX];
       if (!confstr(_CS_DARWIN_USER_CACHE_DIR, buf, sizeof(buf)))
@@ -118,6 +199,10 @@ setup(void) {
     atomic_store(&kept_bytes, bytes);
     keep_queue = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
     keep_group = dispatch_group_create();
+    in_flight = [[NSMutableArray alloc] init];
+    dispatch_group_async(keep_group, keep_queue, ^{
+      sweep();
+    });
     fprintf(stderr, "mullion: pipeline cache: %llu pipelines in %lu keys (%.1f MB of %llu MB) in %s\n",
             (unsigned long long)files, (unsigned long)index_files.count, bytes / 1e6,
             (unsigned long long)(cap_bytes >> 20), directory.UTF8String);
@@ -292,11 +377,13 @@ pc_make(id<MTLDevice> device, id descriptor, char kind, id<MTLFunction> const *f
    * pipeline and then adding it compiled everything twice, and a first run took minutes more. */
   atomic_fetch_add(&misses, 1);
   id<MTLBinaryArchive> archive = nil;
+  NSNumber *flight = nil;
   id state = nil;
   if (atomic_load(&kept_bytes) < cap_bytes) {
     MTLBinaryArchiveDescriptor *empty = [[MTLBinaryArchiveDescriptor alloc] init];
     archive = [device newBinaryArchiveWithDescriptor:empty error:nil];
     [empty release];
+    flight = begin_flight();
     NSError *failure = nil;
     if (archive && add(archive, descriptor, &failure)) {
       id mine = [descriptor copy];
@@ -310,6 +397,8 @@ pc_make(id<MTLDevice> device, id descriptor, char kind, id<MTLFunction> const *f
     if (!state) {
       [archive release];
       archive = nil;
+      end_flight(flight);
+      flight = nil;
     }
   } else
     atomic_fetch_add(&over_cap, 1);
@@ -317,6 +406,8 @@ pc_make(id<MTLDevice> device, id descriptor, char kind, id<MTLFunction> const *f
     state = make(descriptor, MTLPipelineOptionNone, error);
   if (!state || !archive) {
     [archive release];
+    if (flight)
+      end_flight(flight);
     return state;
   }
   [key retain];
@@ -350,6 +441,9 @@ pc_make(id<MTLDevice> device, id descriptor, char kind, id<MTLFunction> const *f
                 failure.localizedDescription.UTF8String ?: "unknown");
     }
     [archive release];
+    end_flight(flight);
+    if (atomic_fetch_add(&let_go, 1) % 16 == 15)
+      sweep();
     [key release];
   });
   return state;
