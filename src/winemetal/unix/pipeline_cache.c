@@ -24,6 +24,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <CommonCrypto/CommonDigest.h>
+#include <libkern/OSByteOrder.h>
 #include <objc/runtime.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -45,6 +46,7 @@ static dispatch_group_t keep_group;
 static atomic_uint written;
 static atomic_ullong hits, misses, unkeyed, opened, kept_failed, kept_bytes, kept_count, over_cap;
 static uint64_t cap_bytes;
+static int keep_air; /* MULLION_PIPELINE_CACHE_AIR=1 keeps the functions' AIR in each archive */
 
 static NSString *
 sanitized(NSString *text) {
@@ -111,6 +113,8 @@ setup(void) {
     /* A first run of PBZ wrote 30 GB in minutes and filled the disk: what is kept stops at a cap. */
     const char *cap = getenv("MULLION_PIPELINE_CACHE_MAX_MB");
     cap_bytes = (uint64_t)(cap && atoll(cap) > 0 ? atoll(cap) : 4096) << 20;
+    const char *air = getenv("MULLION_PIPELINE_CACHE_AIR");
+    keep_air = air && !strcmp(air, "1");
     atomic_store(&kept_bytes, bytes);
     keep_queue = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
     keep_group = dispatch_group_create();
@@ -119,6 +123,49 @@ setup(void) {
             (unsigned long long)(cap_bytes >> 20), directory.UTF8String);
     atexit(report);
   }
+}
+
+/* An archive is a fat file of two slices: the functions' AIR, a metallib, and the GPU's
+ * code. Metal finds a pipeline in the GPU's slice alone, and the AIR was a third of the
+ * probe's archives, so the metallib slice is dropped after writing. Anything else is kept
+ * as written. */
+static NSData *
+without_air(NSData *archive) {
+  const uint8_t *bytes = archive.bytes;
+  const size_t length = archive.length;
+  if (length < 8 || OSReadBigInt32(bytes, 0) != 0xcbfebabe)
+    return nil;
+  const uint32_t count = OSReadBigInt32(bytes, 4);
+  if (count < 2 || count > 16 || length < 8 + 20 * (size_t)count)
+    return nil;
+  uint32_t kept[16][5], kept_count = 0;
+  for (uint32_t i = 0; i < count; i++) {
+    uint32_t field[5];
+    for (int f = 0; f < 5; f++)
+      field[f] = OSReadBigInt32(bytes, 8 + 20 * i + 4 * f);
+    if ((uint64_t)field[2] + field[3] > length || field[4] > 16)
+      return nil;
+    if (field[3] >= 4 && !memcmp(bytes + field[2], "MTLB", 4))
+      continue;
+    memcpy(kept[kept_count++], field, sizeof(field));
+  }
+  if (!kept_count || kept_count == count)
+    return nil;
+  NSMutableData *out = [NSMutableData dataWithLength:8 + 20 * kept_count];
+  uint8_t *header = out.mutableBytes;
+  OSWriteBigInt32(header, 0, 0xcbfebabe);
+  OSWriteBigInt32(header, 4, kept_count);
+  for (uint32_t i = 0; i < kept_count; i++) {
+    const uint64_t align = 1ull << kept[i][4];
+    const uint64_t offset = (out.length + align - 1) / align * align;
+    [out setLength:offset];
+    [out appendBytes:bytes + kept[i][2] length:kept[i][3]];
+    header = out.mutableBytes;
+    const uint32_t field[5] = {kept[i][0], kept[i][1], (uint32_t)offset, kept[i][3], kept[i][4]};
+    for (int f = 0; f < 5; f++)
+      OSWriteBigInt32(header, 8 + 20 * i + 4 * f, field[f]);
+  }
+  return out;
 }
 
 static void
@@ -282,6 +329,11 @@ pc_make(id<MTLDevice> device, id descriptor, char kind, id<MTLFunction> const *f
       [[NSFileManager defaultManager] createDirectoryAtPath:folder withIntermediateDirectories:YES attributes:nil
                                                       error:nil];
       if ([archive serializeToURL:[NSURL fileURLWithPath:path] error:&failure]) {
+        if (keep_air != 1) {
+          NSData *thin = without_air([NSData dataWithContentsOfFile:path]);
+          if (thin)
+            [thin writeToFile:path atomically:YES];
+        }
         uint64_t size = [[[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil] fileSize];
         atomic_fetch_add(&kept_bytes, size);
         if (atomic_fetch_add(&kept_count, 1) % 1000 == 999)
