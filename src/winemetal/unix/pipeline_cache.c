@@ -18,8 +18,9 @@
  * pipelines/<GPU>-<OS build>/<xx>/<key>-<pid>-<n>.bin beside Mullion's cache, off
  * the calling thread. The key leaves out pipeline state: Metal matches the whole
  * pipeline in the archives, so a key several pipelines share costs only another
- * file to open. What is written stops at MULLION_PIPELINE_CACHE_MAX_MB (4096).
- * MULLION_PIPELINE_CACHE=0 turns it off.
+ * file to open. What is written stops at MULLION_PIPELINE_CACHE_MAX_MB (10240): PBZ's
+ * pipelines came to 84 KB each and about 6.7 GB in all, and a pipeline left out is
+ * compiled again on every launch. MULLION_PIPELINE_CACHE=0 turns it off.
  *
  * Adding a pipeline to an archive makes a gpuarchiver-* folder of about 380 KB in
  * Metal's shader cache, which serializing reads and nothing ever removes: a run of
@@ -193,7 +194,7 @@ setup(void) {
     }
     /* A first run of PBZ wrote 30 GB in minutes and filled the disk: what is kept stops at a cap. */
     const char *cap = getenv("MULLION_PIPELINE_CACHE_MAX_MB");
-    cap_bytes = (uint64_t)(cap && atoll(cap) > 0 ? atoll(cap) : 4096) << 20;
+    cap_bytes = (uint64_t)(cap && atoll(cap) > 0 ? atoll(cap) : 10240) << 20;
     const char *air = getenv("MULLION_PIPELINE_CACHE_AIR");
     keep_air = air && !strcmp(air, "1");
     atomic_store(&kept_bytes, bytes);
