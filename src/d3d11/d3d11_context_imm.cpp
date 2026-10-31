@@ -761,6 +761,7 @@ public:
 
   virtual void
   WaitUntilGPUIdle() override {
+    std::lock_guard<d3d11_device_mutex> lock(mutex);
     uint64_t seq = cmd_queue.CurrentSeqId();
     if(!InvalidateCurrentPass())
       Commit();
@@ -776,6 +777,7 @@ public:
   };
 
   HRESULT STDMETHODCALLTYPE Signal(ID3D11Fence *pFence, UINT64 Value) override {
+    std::lock_guard<d3d11_device_mutex> lock(mutex);
     return SignalEvent(static_cast<MTLD3D11Fence *>(pFence)->event, Value);
   }
 
@@ -822,6 +824,7 @@ public:
   }
 
   HRESULT STDMETHODCALLTYPE Wait(ID3D11Fence *pFence, UINT64 Value) override {
+    std::lock_guard<d3d11_device_mutex> lock(mutex);
     auto fence = static_cast<MTLD3D11Fence *>(pFence);
 
     Flush();
