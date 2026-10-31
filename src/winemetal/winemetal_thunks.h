@@ -578,6 +578,18 @@ struct unixcall_metal4_feedback {
   struct WMTMetal4Feedback ret;
 };
 
+struct unixcall_metal4_temporal_scale {
+  obj_handle_t buffer, scaler, color, output, depth, motion, exposure, fence;
+  struct WMTConstMemoryPointer props, waits;
+  uint64_t wait_count;
+};
+struct unixcall_mtldevice_fxscales {
+  obj_handle_t device;
+  struct WMTFXTemporalScales ret;
+};
+
+STATIC_ASSERT(sizeof(struct unixcall_metal4_temporal_scale) == 88);
+STATIC_ASSERT(sizeof(struct unixcall_mtldevice_fxscales) == 16);
 STATIC_ASSERT(sizeof(struct unixcall_metal4_new) == 64);
 STATIC_ASSERT(sizeof(struct unixcall_metal4_encoder) == 40);
 STATIC_ASSERT(sizeof(struct unixcall_metal4_commands) == 24);

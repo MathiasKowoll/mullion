@@ -1985,3 +1985,33 @@ MTL4CommandBuffer_orderAliases(obj_handle_t buffer) {
   struct unixcall_generic_obj_noret p = {.handle = buffer};
   UNIX_CALL(WMTUnixMetal4OrderAliases, &p);
 }
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newMTL4TemporalScaler(obj_handle_t device, const struct WMTFXTemporalScalerInfo *info) {
+  struct unixcall_mtldevice_newfxtemporalscaler params = {.device = device};
+  WMT_MEMPTR_SET(params.info, info);
+  UNIX_CALL(WMTUnixDeviceNewMTL4TemporalScaler, &params);
+  return params.ret;
+}
+
+WINEMETAL_API struct WMTFXTemporalScales
+MTLDevice_temporalScalerScales(obj_handle_t device) {
+  struct unixcall_mtldevice_fxscales p = {.device = device};
+  UNIX_CALL(WMTUnixDeviceTemporalScalerScales, &p);
+  return p.ret;
+}
+
+WINEMETAL_API void
+MTL4CommandBuffer_encodeTemporalScale(
+    obj_handle_t buffer, obj_handle_t scaler, obj_handle_t color, obj_handle_t output, obj_handle_t depth,
+    obj_handle_t motion, obj_handle_t exposure, obj_handle_t fence, const struct WMTFXTemporalScalerProps *props,
+    const obj_handle_t *waits, uint32_t wait_count
+) {
+  struct unixcall_metal4_temporal_scale p = {
+      .buffer = buffer, .scaler = scaler, .color = color, .output = output, .depth = depth, .motion = motion,
+      .exposure = exposure, .fence = fence, .wait_count = wait_count
+  };
+  WMT_MEMPTR_SET(p.props, props);
+  WMT_MEMPTR_SET(p.waits, waits);
+  UNIX_CALL(WMTUnixMetal4TemporalScale, &p);
+}

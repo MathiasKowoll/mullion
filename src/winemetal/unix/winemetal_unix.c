@@ -1753,11 +1753,9 @@ static const int SIGNALS[] = {
 #endif
 };
 
-static NTSTATUS
-CREATES(_MTLDevice_newTemporalScaler)(void *obj) {
-  struct unixcall_mtldevice_newfxtemporalscaler *params = obj;
+static MTLFXTemporalScalerDescriptor *
+temporal_scaler_descriptor(const struct WMTFXTemporalScalerInfo *info) {
   MTLFXTemporalScalerDescriptor *desc = [[MTLFXTemporalScalerDescriptor alloc] init];
-  const struct WMTFXTemporalScalerInfo *info = params->info.ptr;
   desc.colorTextureFormat = to_metal_pixel_format(info->color_format);
   desc.outputTextureFormat = to_metal_pixel_format(info->output_format);
   desc.depthTextureFormat = to_metal_pixel_format(info->depth_format);
@@ -1775,6 +1773,13 @@ CREATES(_MTLDevice_newTemporalScaler)(void *obj) {
   }
   #endif
   desc.autoExposureEnabled = info->auto_exposure;
+  return desc;
+}
+
+static NTSTATUS
+CREATES(_MTLDevice_newTemporalScaler)(void *obj) {
+  struct unixcall_mtldevice_newfxtemporalscaler *params = obj;
+  MTLFXTemporalScalerDescriptor *desc = temporal_scaler_descriptor(params->info.ptr);
 
   struct sigaction old_action[sizeof(SIGNALS) / sizeof(int)], new_action;
   if (@available(macOS 16, *)) {} else {
@@ -4901,6 +4906,124 @@ _MTL4CommandBuffer_orderAliases(void *obj) {
   return STATUS_SUCCESS;
 }
 
+// the device's compiler for MetalFX's Metal 4 scalers, made once: MetalFX builds their pipelines with it
+static id<MTL4Compiler>
+API_AVAILABLE(macos(26.0)) metalfx_compiler(id<MTLDevice> device) {
+  static char key;
+  @synchronized(device) {
+    id<MTL4Compiler> compiler = objc_getAssociatedObject(device, &key);
+    if (!compiler) {
+      MTL4CompilerDescriptor *desc = [[MTL4CompilerDescriptor alloc] init];
+      compiler = [device newCompilerWithDescriptor:desc error:nil];
+      [desc release];
+      if (compiler) {
+        objc_setAssociatedObject(device, &key, compiler, OBJC_ASSOCIATION_RETAIN);
+        [compiler release];
+      }
+    }
+    return compiler;
+  }
+}
+
+static NTSTATUS
+CREATES(_MTLDevice_newMTL4TemporalScaler)(void *obj) {
+  struct unixcall_mtldevice_newfxtemporalscaler *params = obj;
+  params->ret = 0;
+  if (@available(macOS 26.0, *)) {
+    id<MTLDevice> device = (id<MTLDevice>)params->device;
+    id<MTL4Compiler> compiler = metalfx_compiler(device);
+    if (!compiler)
+      return STATUS_SUCCESS;
+    MTLFXTemporalScalerDescriptor *desc = temporal_scaler_descriptor(params->info.ptr);
+    params->ret = (obj_handle_t)[desc newTemporalScalerWithDevice:device compiler:compiler];
+    [desc release];
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_temporalScalerScales(void *obj) {
+  struct unixcall_mtldevice_fxscales *p = obj;
+  id<MTLDevice> device = (id<MTLDevice>)p->device;
+  p->ret.min = p->ret.max = 0;
+  if ([MTLFXTemporalScalerDescriptor supportsDevice:device]) {
+    p->ret.min = [MTLFXTemporalScalerDescriptor supportedInputContentMinScaleForDevice:device];
+    p->ret.max = [MTLFXTemporalScalerDescriptor supportedInputContentMaxScaleForDevice:device];
+  }
+  return STATUS_SUCCESS;
+}
+
+// MetalFX waits for the scaler's fence before its work and updates it after (MTLFXTemporalScalerBase.fence), which
+// holds of the Metal 4 scaler as of the classic one: measured on an M4 Max under macOS 27.2, with the fence alone
+// ordering them, a scaler's input written by a 58 ms kernel and its output copied out after it read back right; with
+// no fence the copy read the output before the scaler had written it. an encoder ahead of the scaler waits for the
+// passes before and updates its fence, one after it waits for that and updates the buffer's, which the passes after
+// wait for
+static NTSTATUS
+_MTL4CommandBuffer_encodeTemporalScale(void *obj) {
+  struct unixcall_metal4_temporal_scale *p = obj;
+  if (@available(macOS 26.0, *)) {
+    MullionMetal4Buffer *owner = (MullionMetal4Buffer *)p->buffer;
+    id<MTL4FXTemporalScaler> scaler = (id<MTL4FXTemporalScaler>)p->scaler;
+    id<MTLFence> fence = (id<MTLFence>)p->fence;
+    if (owner->feedback.error || !scaler || !fence)
+      return STATUS_SUCCESS;
+    [owner closeCompute];
+    id<MTL4ComputeCommandEncoder> begin = [owner->buffer computeCommandEncoder];
+    if (!begin) {
+      [owner fail:nil];
+      return STATUS_SUCCESS;
+    }
+    [begin setLabel:@"BeginScaler"];
+    if (owner->order_aliases) {
+      owner->order_aliases = false;
+      [begin barrierAfterQueueStages:MTLStageAll
+                        beforeStages:MTLStageAll
+                   visibilityOptions:MTL4VisibilityOptionDevice | MTL4VisibilityOptionResourceAlias];
+    }
+    const obj_handle_t *waits = p->waits.ptr;
+    for (uint64_t i = 0; i < p->wait_count; i++)
+      [begin waitForFence:(id<MTLFence>)waits[i] beforeEncoderStages:MTLStageAll];
+    [begin updateFence:fence afterEncoderStages:MTLStageAll];
+    [begin endEncoding];
+
+    const struct WMTFXTemporalScalerProps *props = p->props.ptr;
+    metal4_resident(owner, (id<MTLTexture>)p->color);
+    metal4_resident(owner, (id<MTLTexture>)p->output);
+    metal4_resident(owner, (id<MTLTexture>)p->depth);
+    metal4_resident(owner, (id<MTLTexture>)p->motion);
+    metal4_resident(owner, (id<MTLTexture>)p->exposure);
+    scaler.colorTexture = (id<MTLTexture>)p->color;
+    scaler.outputTexture = (id<MTLTexture>)p->output;
+    scaler.depthTexture = (id<MTLTexture>)p->depth;
+    scaler.motionTexture = (id<MTLTexture>)p->motion;
+    scaler.exposureTexture = (id<MTLTexture>)p->exposure;
+    scaler.fence = fence;
+    scaler.inputContentWidth = props->input_content_width;
+    scaler.inputContentHeight = props->input_content_height;
+    scaler.reset = props->reset;
+    scaler.depthReversed = props->depth_reversed;
+    scaler.motionVectorScaleX = props->motion_vector_scale_x;
+    scaler.motionVectorScaleY = props->motion_vector_scale_y;
+    scaler.jitterOffsetX = props->jitter_offset_x;
+    scaler.jitterOffsetY = props->jitter_offset_y;
+    scaler.preExposure = props->pre_exposure;
+    [scaler encodeToCommandBuffer:owner->buffer];
+
+    id<MTL4ComputeCommandEncoder> end = [owner->buffer computeCommandEncoder];
+    if (!end) {
+      [owner fail:nil];
+      return STATUS_SUCCESS;
+    }
+    [end setLabel:@"EndScaler"];
+    [end waitForFence:fence beforeEncoderStages:MTLStageAll];
+    [end updateFence:owner->fence afterEncoderStages:MTLStageAll];
+    [end endEncoding];
+    owner->feedback.compute_passes += 2;
+  }
+  return STATUS_SUCCESS;
+}
+
 static NTSTATUS
 _MTL4CommandEncoder_endEncoding(void *obj) {
   struct unixcall_generic_obj_uint64_noret *p = obj;
@@ -6144,6 +6267,9 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLDevice_supportsShaderBarycentricCoordinates,
     &_WMTTraceWrite,
     &_MTL4CommandBuffer_orderAliases,
+    &_MTLDevice_newMTL4TemporalScaler,
+    &_MTLDevice_temporalScalerScales,
+    &_MTL4CommandBuffer_encodeTemporalScale,
 };
 
 #ifndef MULLION_NATIVE
@@ -6343,6 +6469,9 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLDevice_supportsShaderBarycentricCoordinates,
     &_WMTTraceWrite,
     &_MTL4CommandBuffer_orderAliases,
+    &_MTLDevice_newMTL4TemporalScaler,
+    &_MTLDevice_temporalScalerScales,
+    &_MTL4CommandBuffer_encodeTemporalScale,
 };
 _Static_assert(sizeof(__wine_unix_call_wow64_funcs) / sizeof(__wine_unix_call_wow64_funcs[0]) == WMTUnixCallCount,
                "32-bit bridge call count");

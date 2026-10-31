@@ -29,8 +29,8 @@ TemporalScaler::decRef() {
     delete this;
 }
 
-TemporalScaler::TemporalScaler(WMT::Device device, const WMTFXTemporalScalerInfo &info) {
-  scaler_ = device.newTemporalScaler(info);
+TemporalScaler::TemporalScaler(WMT::Device device, const WMTFXTemporalScalerInfo &info, bool metal4) {
+  scaler_ = metal4 ? device.newMTL4TemporalScaler(info) : device.newTemporalScaler(info);
   fence_ = device.newFence();
 }
 

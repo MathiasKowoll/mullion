@@ -1002,6 +1002,19 @@ public:
   orderAliases() {
     MTL4CommandBuffer_orderAliases(handle);
   }
+  template <size_t N>
+  void
+  encodeTemporalScale(
+      FXTemporalScaler scaler, Texture color, Texture output, Texture depth, Texture motion, Texture exposure,
+      Fence fence, const WMTFXTemporalScalerProps &props, const std::array<Fence, N> &waits, unsigned count
+  ) {
+    std::array<obj_handle_t, N> handles;
+    for (unsigned i = 0; i < count; i++)
+      handles[i] = waits[i].handle;
+    MTL4CommandBuffer_encodeTemporalScale(
+        handle, scaler, color, output, depth, motion, exposure, fence, &props, handles.data(), count
+    );
+  }
   void
   commit() {
     MTL4CommandBuffer_commit(handle);
@@ -1405,6 +1418,16 @@ public:
   Reference<FXTemporalScaler>
   newTemporalScaler(const WMTFXTemporalScalerInfo &info) {
     return Reference<FXTemporalScaler>(MTLDevice_newTemporalScaler(handle, &info));
+  }
+
+  Reference<FXTemporalScaler>
+  newMTL4TemporalScaler(const WMTFXTemporalScalerInfo &info) {
+    return Reference<FXTemporalScaler>(MTLDevice_newMTL4TemporalScaler(handle, &info));
+  }
+
+  WMTFXTemporalScales
+  temporalScalerScales() {
+    return MTLDevice_temporalScalerScales(handle);
   }
 
   Reference<FXSpatialScaler>

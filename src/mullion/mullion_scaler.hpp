@@ -31,7 +31,8 @@ public:
   void incRef();
   void decRef();
 
-  TemporalScaler(WMT::Device device, const WMTFXTemporalScalerInfo &info);
+  // a Metal 4 scaler encodes into a Metal 4 command buffer (MTL4FXTemporalScaler), a classic one into a classic one
+  TemporalScaler(WMT::Device device, const WMTFXTemporalScalerInfo &info, bool metal4 = false);
 
   WMT::FXTemporalScaler scaler() {
     return scaler_;

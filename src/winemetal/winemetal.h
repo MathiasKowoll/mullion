@@ -2481,7 +2481,9 @@ enum { WMTUnixSampledEncoder = 167, WMTUnixDiagWrite, WMTUnixDispatchDataBytes, 
        WMTUnixCommandBufferPopDebugGroup, WMTUnixFlightWrite, WMTUnixMetal4NewBuffer, WMTUnixMetal4Encoder,
        WMTUnixMetal4Commands, WMTUnixMetal4EndEncoder, WMTUnixMetal4Commit, WMTUnixMetal4Feedback, WMTUnixMetal4Wait,
        WMTUnixMetal4CounterHeap, WMTUnixMetal4Frequency, WMTUnixMetal4Present, WMTUnixMetal4WaitEvent,
-       WMTUnixDeviceSupportsShaderBarycentrics, WMTUnixTraceWrite, WMTUnixMetal4OrderAliases, WMTUnixCallCount };
+       WMTUnixDeviceSupportsShaderBarycentrics, WMTUnixTraceWrite, WMTUnixMetal4OrderAliases,
+       WMTUnixDeviceNewMTL4TemporalScaler, WMTUnixDeviceTemporalScalerScales, WMTUnixMetal4TemporalScale,
+       WMTUnixCallCount };
 WINEMETAL_API obj_handle_t MTLCommandBuffer_sampledCommandEncoder(obj_handle_t cmdbuf, enum WMTSampledEncoder type,
                                                                   const struct WMTSampleBufferAttachmentInfo *samples,
                                                                   const struct WMTRenderPassInfo *render_info);
@@ -2566,5 +2568,22 @@ WINEMETAL_API void MTL4CommandBuffer_waitForEvent(obj_handle_t buffer, obj_handl
 // the buffer's next encoder begins with a barrier, against all the queue's work before it, that makes memory reached
 // through aliased addresses consistent: a reserved buffer's tiles and a placed resource over the same heap memory
 WINEMETAL_API void MTL4CommandBuffer_orderAliases(obj_handle_t buffer);
+
+// MetalFX's temporal scaler for a Metal 4 command buffer (MTL4FXTemporalScaler), made with a compiler of the device's
+WINEMETAL_API obj_handle_t
+MTLDevice_newMTL4TemporalScaler(obj_handle_t device, const struct WMTFXTemporalScalerInfo *info);
+// the input content scales MetalFX's temporal scaler takes on the device, output size over input content size
+// (MTLFXTemporalScalerDescriptor supportedInputContentMinScaleForDevice: and ...MaxScaleForDevice:); zero for none
+struct WMTFXTemporalScales {
+  float min, max;
+};
+WINEMETAL_API struct WMTFXTemporalScales MTLDevice_temporalScalerScales(obj_handle_t device);
+// a Metal 4 scaler's work, in order with the buffer's passes: it starts once the `waits` fences are reached, and the
+// buffer's fence is reached once it is done. `fence` is the scaler's own
+WINEMETAL_API void MTL4CommandBuffer_encodeTemporalScale(
+    obj_handle_t buffer, obj_handle_t scaler, obj_handle_t color, obj_handle_t output, obj_handle_t depth,
+    obj_handle_t motion, obj_handle_t exposure, obj_handle_t fence, const struct WMTFXTemporalScalerProps *props,
+    const obj_handle_t *waits, uint32_t wait_count
+);
 
 #endif
