@@ -760,6 +760,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
                              : pass.type == EncoderType::Blit    ? "Blit"
                              : pass.type == EncoderType::Compute || pass.type == EncoderType::ComputeParts ? "Compute"
                              : pass.type == EncoderType::Resolve ? "Resolve"
+                             : pass.type == EncoderType::TemporalUpscale ? "Upscale"
                                                                  : "AccelerationStructure";
           std::string runs;
           auto name = [&](uint64_t pipeline) {
@@ -1420,7 +1421,8 @@ public:
             (current->type == EncoderType::Clear || current->type == EncoderType::Render ||
              current->type == EncoderType::Blit || current->type == EncoderType::Compute ||
              current->type == EncoderType::ComputeParts ||
-             current->type == EncoderType::Resolve || current->type == EncoderType::AccelerationStructure)) {
+             current->type == EncoderType::Resolve || current->type == EncoderType::AccelerationStructure ||
+             (Metal4 && current->type == EncoderType::TemporalUpscale))) {
           auto &buffer = profile_->buffers[inflight_cmdbuf_seq_.load() % kCommandQueueSize];
           // Metal 3 samples a render pass's vertex and fragment stages; Metal 4 times each pass between encoders
           // (metal4_stamp in winemetal_unix.c)
@@ -1570,6 +1572,14 @@ public:
             );
             // its first encoder began with the aliasing barrier the queue carried (OrderAliases)
             order_aliases_ = false;
+            // MetalFX's encoders take no samples: an empty one after them, waiting for what its last one updated, ends
+            // the profile's pass when the upscale has
+            if (attachment.sample_buffer) {
+              auto mark = cmdbuf.computeCommandEncoder(attachment, true);
+              mark.waitForFence(fence_);
+              mark.updateFence(fence_);
+              mark.endEncoding();
+            }
           } else {
             auto begin = cmdbuf.blitCommandEncoder();
             begin.setLabel(WMT::String::string("BeginScaler", WMTUTF8StringEncoding));
