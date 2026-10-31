@@ -6274,6 +6274,8 @@ public:
       if(output->pixelFormat() != entry.output_pixel_format) continue;
       if(depth->pixelFormat() != entry.depth_pixel_format) continue;
       if(motion_vector_format != entry.motion_vector_pixel_format) continue;
+      // motion vectors at the output's size need the scaler that downscales them, those at the input's the other
+      if(pDesc->MotionVectorInDisplayRes != (entry.mv_downscaled != nullptr)) continue;
 
       scaler = entry.scaler;
       mv_downscaled = entry.mv_downscaled;
@@ -6313,7 +6315,8 @@ public:
         tex_info.depth = 1;
         tex_info.array_length = 1;
         tex_info.mipmap_level_count = 1;
-        tex_info.pixel_format = WMTPixelFormatRG32Float;
+        // the format the scaler was made for (info.motion_format)
+        tex_info.pixel_format = motion_vector_format;
         tex_info.sample_count = 1;
         tex_info.type = WMTTextureType2D;
         tex_info.usage = WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite;
@@ -6380,7 +6383,7 @@ public:
         WMTFXTemporalScalerProps new_props = props;
         new_props.motion_vector_scale_x = 1.0;
         new_props.motion_vector_scale_y = 1.0;
-        enc.upscaleTemporal(input, output, depth, mv_downscaled, 0, exposure, scaler, new_props);
+        enc.upscaleTemporal(input, output, depth, mv_downscaled, mv_downscaled->fullView, exposure, scaler, new_props);
       } else {
         enc.upscaleTemporal(input, output, depth, motion_vector, mv_view, exposure, scaler, props);
       }
