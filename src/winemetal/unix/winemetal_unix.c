@@ -15,6 +15,7 @@
 #include <mach/mach_port.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <mach/mach_vm.h>
 #include <sys/sysctl.h>
 #define WINEMETAL_API
 #include "../winemetal_thunks.h"
@@ -230,6 +231,33 @@ _MTLCommandBuffer_encodeSignalEvent(void *obj) {
   return STATUS_SUCCESS;
 }
 
+// Metal refuses to wrap memory whose mappings do not meet on its own pages: a refusal names the first place inside the
+// range where they meet elsewhere, since a 4 KB host map lets them
+static void
+refused_without_copy(void *ptr, uint64_t length) {
+  mach_vm_address_t address = (mach_vm_address_t)ptr, end = address + length;
+  unsigned mappings = 0;
+  while (address < end) {
+    mach_vm_size_t size = 0;
+    natural_t depth = 0;
+    vm_region_submap_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+    if (mach_vm_region_recurse(mach_task_self(), &address, &size, &depth, (vm_region_recurse_info_t)&info, &count) !=
+        KERN_SUCCESS)
+      break;
+    mappings++;
+    if (address + size < end && (address + size) % vm_kernel_page_size) {
+      fprintf(stderr, "winemetal: Metal refused %p+%#llx without a copy: a mapping ends at %#llx, inside a %lu KB page\n",
+              ptr, (unsigned long long)length, (unsigned long long)(address + size),
+              (unsigned long)vm_kernel_page_size / 1024);
+      return;
+    }
+    address += size;
+  }
+  fprintf(stderr, "winemetal: Metal refused %p+%#llx without a copy, in %u mappings\n", ptr,
+          (unsigned long long)length, mappings);
+}
+
 static NTSTATUS
 CREATES(_MTLDevice_newBuffer)(void *obj) {
   struct unixcall_mtldevice_newbuffer *params = obj;
@@ -241,6 +269,8 @@ CREATES(_MTLDevice_newBuffer)(void *obj) {
                                        length:info->length
                                       options:(enum MTLResourceOptions)info->options
                                   deallocator:NULL];
+    if (!buffer)
+      refused_without_copy(info->memory.ptr, info->length);
   } else {
     buffer = [device newBufferWithLength:info->length options:(enum MTLResourceOptions)info->options];
     info->memory.ptr = [buffer storageMode] == MTLStorageModePrivate ? NULL : [buffer contents];
