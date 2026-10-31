@@ -12,7 +12,7 @@ hand, and its commit message names the DXMT commit it ports. Mullion's own commi
 - Base: [`7c8dee1`](https://github.com/3Shain/dxmt/commit/7c8dee1c2d73415301ceb7d1fa810861cef4cd67) (16 September
   2026), as Mullion's README says.
 - Listed up to: [`3b25259`](https://github.com/3Shain/dxmt/commit/3b252590cb0290e36fca6f088b5255b871d2d95a)
-  (27 October 2026), 121 commits after the base. None is ported yet.
+  (27 October 2026), 121 commits after the base. On 31 October 2026, 13 are ported and 21 were already done in Mullion.
 
 DXMT now writes a Direct3D 12 and a DXIL front end of its own, beside Mullion's, which were written independently.
 Those commits are a reference for what Mullion lacks (DXMT's tessellation pipeline, for one), not patches. Each other
