@@ -118,7 +118,12 @@ to, and the pipelines Metal compiled from that.
 pipelines named at `trace`, the containers of the shaders involved, named by hash with a `.dxbc` extension whether
 they hold DXBC or DXIL ([`d3d12_pipeline_graphics.cpp`](../src/d3d12/d3d12_pipeline_graphics.cpp)). Direct3D 11
 writes `shader_dump_<hash>.cso` into the working directory on selected failure paths, only in builds with the
-`mullion_debug` option ([`d3d11_pipeline_cache.cpp`](../src/d3d11/d3d11_pipeline_cache.cpp)). Some refusals happen
+`mullion_debug` option ([`d3d11_pipeline_cache.cpp`](../src/d3d11/d3d11_pipeline_cache.cpp)). A ray tracing state
+object that `CreateStateObject` refuses logs each distinct cause once, with the export, its kind, the step that refused
+it (library, compile, validation or unresolved association) and what the converter or Metal said; with
+`MULLION_DIAG_PATH` set it also writes its DXIL libraries and its collections' as `<sha1>.dxil`, its root signatures as
+`<sha1>.rootsig`, and a `<sha1>.txt` listing its subobjects and causes, up to 8 MB a process
+([`d3d12_state_object.cpp`](../src/d3d12/d3d12_state_object.cpp)). Some refusals happen
 before any dump, and a dump file is checked before it is used as evidence. {logging: one dump format for both APIs,
 holding the bytecode, the stages, the root signature, the conversion options and the converted output}.
 
