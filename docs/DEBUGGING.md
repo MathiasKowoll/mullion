@@ -118,7 +118,12 @@ to, and the pipelines Metal compiled from that.
 pipelines named at `trace`, the containers of the shaders involved, named by hash with a `.dxbc` extension whether
 they hold DXBC or DXIL ([`d3d12_pipeline_graphics.cpp`](../src/d3d12/d3d12_pipeline_graphics.cpp)). Direct3D 11
 writes `shader_dump_<hash>.cso` into the working directory on selected failure paths, only in builds with the
-`mullion_debug` option ([`d3d11_pipeline_cache.cpp`](../src/d3d11/d3d11_pipeline_cache.cpp)). Some refusals happen
+`mullion_debug` option ([`d3d11_pipeline_cache.cpp`](../src/d3d11/d3d11_pipeline_cache.cpp)). A ray tracing state
+object that `CreateStateObject` refuses logs each distinct cause once, with the export, its kind, the step that refused
+it (library, compile, validation or unresolved association) and what the converter or Metal said; with
+`MULLION_DIAG_PATH` set it also writes its DXIL libraries and its collections' as `<sha1>.dxil`, its root signatures as
+`<sha1>.rootsig`, and a `<sha1>.txt` listing its subobjects and causes, up to 8 MB a process
+([`d3d12_state_object.cpp`](../src/d3d12/d3d12_state_object.cpp)). Some refusals happen
 before any dump, and a dump file is checked before it is used as evidence. {logging: one dump format for both APIs,
 holding the bytecode, the stages, the root signature, the conversion options and the converted output}.
 
@@ -170,8 +175,13 @@ Wine's console output names the file. A process that ends after such a dump adds
 
 **A slow frame** is profiled with `MULLION_DIAG=profile` and `MULLION_DIAG_PATH`, a macOS directory, and read with
 [`tools/mullion-diag`](../tools/mullion-diag): `mullion-diag report <directory>` lists frame times and where their
-time goes, and `mullion-diag frames <directory>` summarizes the present intervals of each recording. Its own
-description lists what the records do not cover, and how D3D12 passes are timed on Metal 4 and Metal 3;
+time goes, and `mullion-diag frames <directory>` summarizes the present intervals of each recording. The report says
+of each frame whether the GPU was busy (any queue's command buffer running 90% of it or more) or idle, and what held
+it idle: command buffers committed and not started, held back by a queue's Wait, a wait for a drawable, Mullion's
+translation or its own waits, the presenting thread's fence and frame latency waits, or the application. It gives the
+GPU's idle gaps, each queue's busy time and the direct and compute queues' overlap, each command buffer's way from
+ExecuteCommandLists to the GPU's start, and the CPU's side: the time between Present calls and inside them, waits,
+submissions, Mullion's encoding and the time lists are open. Its own description lists what the records do not cover, and how D3D12 passes are timed on Metal 4 and Metal 3;
 [`tests/held.py`](../tests/held.py) checks the profile against workloads whose bounds and passes are known.
 {logging: one offline report that gathers a run's logs, profiles, stacks and shader dumps}.
 

@@ -582,7 +582,9 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     std::vector<WMT::Reference<WMT::CounterSampleBuffer>> heaps;
     // the samples taken from the last heap
     uint32_t used = 0;
-    uint64_t committed = 0, cpu_begin = 0, gpu_begin = 0;
+    // `submitted`: when the application called what the command buffer's first work is of (ExecuteCommandLists or
+    // Present); `ended`: when Mullion ended it, which it is committed at unless a Wait's fence holds it back
+    uint64_t committed = 0, cpu_begin = 0, gpu_begin = 0, submitted = 0, ended = 0;
     struct Pass {
       const EncoderData *pass;
       uint64_t id;
@@ -601,6 +603,8 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     std::array<ProfileBuffer, kCommandQueueSize> buffers;
   };
   std::unique_ptr<ProfileQueue> profile_ = diag::profile ? std::make_unique<ProfileQueue>() : nullptr;
+  // the time of the application's call the work being committed is of, 0 for the queue's own work (ProfileBuffer)
+  std::atomic<uint64_t> submitting_{0};
   // the path of the queue's open events, which only its held work changes and reads (BeginEvent)
   std::string queue_events_;
 
@@ -752,7 +756,8 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         uint64_t cpu_end, gpu_end;
         device_->GetMTLDevice().sampleTimestamps(cpu_end, gpu_end);
         auto lines = diag::Line("cmdbuf", profile_->id, internal_seq, buffer.committed, completed,
-                                inflight.cmdbuf.gpuStartTime(), inflight.cmdbuf.gpuEndTime());
+                                inflight.cmdbuf.gpuStartTime(), inflight.cmdbuf.gpuEndTime(), buffer.submitted,
+                                buffer.ended);
         lines += diag::Line("calibration", profile_->id, internal_seq, buffer.cpu_begin, buffer.gpu_begin, cpu_end, gpu_end);
         for (auto &pass : buffer.passes) {
           const char *kind = pass.type == EncoderType::Clear     ? "Clear"
@@ -868,7 +873,11 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     // command buffer of the queue's encoded already (Metal 3), which the slot then has
     void
     Start(WMT::Reference<MetalCommandBuffer> encoded = {}) {
+      // a wait for a slot: the GPU is kCommandQueueSize command buffers behind
+      auto full = queue->profile_ && queue->inflight_cmdbuf_count_.load() == kCommandQueueSize ? diag::Now() : 0;
       queue->inflight_cmdbuf_count_.wait(kCommandQueueSize, std::memory_order_acquire);
+      if (full)
+        diag::Waited("slot", full);
       queue->inflight_cmdbuf_count_.fetch_add(1, std::memory_order_relaxed);
       auto seq = queue->inflight_cmdbuf_seq_.load(std::memory_order_relaxed);
       inflight = &queue->inflight_cmdbuf_pool_[seq % kCommandQueueSize];
@@ -885,6 +894,8 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       if (queue->profile_) {
         auto &buffer = queue->profile_->buffers[seq % kCommandQueueSize];
         queue->device_->GetMTLDevice().sampleTimestamps(buffer.cpu_begin, buffer.gpu_begin);
+        auto submitted = queue->submitting_.load(std::memory_order_relaxed);
+        buffer.submitted = submitted ? submitted : diag::Now();
       }
     };
 
@@ -908,6 +919,8 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
             )
         );
       }
+      if (queue->profile_)
+        queue->profile_->buffers[queue->inflight_cmdbuf_seq_.load() % kCommandQueueSize].ended = diag::Now();
       (inflight->gate = queue->gate_)->Commit(
           ended, queue->profile_
                      ? &queue->profile_->buffers[queue->inflight_cmdbuf_seq_.load() % kCommandQueueSize].committed
@@ -945,10 +958,13 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     bool
     Settle() {
       auto ended = End();
+      auto began = queue->profile_ ? diag::Now() : 0;
       queue->gate_->closed.wait(true);
       if (ended.status() < WMTCommandBufferStatusCommitted)
         return false;
       ended.waitUntilCompleted();
+      if (began)
+        diag::Waited("settle", began);
       return true;
     }
 
@@ -1076,6 +1092,8 @@ public:
       UINT64 cpu, gpu;
       GetClockCalibration(&gpu, &cpu);
       diag::Write(diag::Line("clock", diag::Nanoseconds(cpu), Rescale(gpu, kGPUTimestampFrequency, timestamp_frequency_)));
+      // the queue's kind (D3D12_COMMAND_LIST_TYPE: 0 direct, 2 compute, 3 copy), which says what its overlap is
+      diag::Write(diag::Line("queue", profile_->id, uint32_t(desc_.Type)));
     }
 
     return S_OK;
@@ -1266,6 +1284,7 @@ public:
 
   void STDMETHODCALLTYPE
   ExecuteCommandLists(UINT Count, ID3D12CommandList *const *ppCommandLists) {
+    auto called = profile_ ? diag::Now() : 0;
     for (UINT i = 0; i < Count; i++)
       if (static_cast<MTLD3D12GraphicsCommandList *>(ppCommandLists[i])->encoder_count ==
           std::numeric_limits<size_t>::max()) {
@@ -1283,14 +1302,22 @@ public:
     }
     Trace("ExecuteCommandLists of ", Count);
     FLIGHT_HEAVY(Sync, "queue %p: ExecuteCommandLists of %llu", this, uint64_t(Count));
-    auto work = [this, recorded = std::move(recorded), allocators = std::move(allocators)]() mutable {
+    auto work = [this, recorded = std::move(recorded), allocators = std::move(allocators), called]() mutable {
       auto began = profile_ ? diag::Now() : 0;
+      submitting_.store(called, std::memory_order_relaxed);
       Commit(recorded, std::move(allocators));
-      if (profile_)
-        diag::Write(diag::Line("span", "execute", recorded.size(), GetCurrentThreadId(), began, diag::Now() - began));
+      submitting_.store(0, std::memory_order_relaxed);
+      if (profile_) {
+        auto now = diag::Now();
+        diag::Later(diag::Line("span", "execute", recorded.size(), GetCurrentThreadId(), began, now - began), now);
+      }
     };
     // the queue's thread encodes the lists, so the application's thread goes on recording
     Hold(work, true);
+    if (called) {
+      auto now = diag::Now();
+      diag::Later(diag::Line("span", "submit", Count, GetCurrentThreadId(), called, now - called), now);
+    }
     Trace("ExecuteCommandLists returns");
   }
 
@@ -2273,13 +2300,19 @@ public:
       device_->first_present.compare_exchange_strong(unset, std::chrono::steady_clock::now());
     }
     auto state = presenter->synchronizeLayerProperties();
+    auto called = profile_ ? diag::Now() : 0;
     if (Holding() &&
         Hold([this, swapchain = Com(swapchain), presenter, backbuffer = Com(backbuffer), view, hLantecyWaitable, after,
-              id, number, state, previous = Com(previous), copies] {
+              id, number, state, previous = Com(previous), copies, called] {
+          submitting_.store(called, std::memory_order_relaxed);
           Commit(presenter, backbuffer.ptr(), view, state, hLantecyWaitable, after, id, number, previous.ptr(), copies);
+          submitting_.store(0, std::memory_order_relaxed);
         }))
       return S_OK;
-    return Commit(presenter, backbuffer, view, state, hLantecyWaitable, after, id, number, previous, copies);
+    submitting_.store(called, std::memory_order_relaxed);
+    auto hr = Commit(presenter, backbuffer, view, state, hLantecyWaitable, after, id, number, previous, copies);
+    submitting_.store(0, std::memory_order_relaxed);
+    return hr;
   }
 
   void

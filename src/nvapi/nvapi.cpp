@@ -728,12 +728,27 @@ NvAPI_DRS_LoadSettings(NvDRSSessionHandle hSession) {
   return NVAPI_NOT_SUPPORTED;
 }
 
-LUID
-GetAdapterLuid(WMT::Device device) {
-  /**
-  TODO: duplicated impl in `dxgi_adapter.cpp`
-  */
-  return std::bit_cast<LUID>(__builtin_bswap64(device.registryID()));
+// the LUID of the DXGI adapter on the Metal device with this registry ID. DXGI takes Wine's adapter identity
+// when it has one (dxgi_adapter.cpp), and D3D11 and D3D12 answer with DXGI's, so asking DXGI keeps a game, NGX or
+// Streamline that matches this GPU to its D3D adapter by LUID on the same adapter, as DXVK-NVAPI does.
+static bool
+GetAdapterLuid(uint64_t registry_id, LUID *luid) {
+  Com<IDXGIFactory1> factory;
+  if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
+    return false;
+
+  Com<IDXGIAdapter1> adapter;
+  for (UINT i = 0; SUCCEEDED(factory->EnumAdapters1(i, &adapter)); i++) {
+    Com<IMTLDXGIAdapter> mtl_adapter;
+    DXGI_ADAPTER_DESC1 desc;
+    if (SUCCEEDED(adapter->QueryInterface(IID_PPV_ARGS(&mtl_adapter))) &&
+        mtl_adapter->GetMTLDevice().registryID() == registry_id && SUCCEEDED(adapter->GetDesc1(&desc))) {
+      *luid = desc.AdapterLuid;
+      return true;
+    }
+    adapter = nullptr;
+  }
+  return false;
 }
 
 NVAPI_INTERFACE
@@ -741,58 +756,28 @@ NvAPI_GPU_GetAdapterIdFromPhysicalGpu(NvPhysicalGpuHandle hPhysicalGpu, void *pO
   if (!pOSAdapterId)
     return NVAPI_INVALID_ARGUMENT;
 
-  auto registry_id = uint64_t(hPhysicalGpu);
-  auto devices = WMT::CopyAllDevices();
-  auto adapter_count = devices.count();
-  if (adapter_count == 0)
+  if (!GetAdapterLuid(uint64_t(hPhysicalGpu), reinterpret_cast<LUID *>(pOSAdapterId)))
     return NVAPI_INVALID_ARGUMENT;
-
-  WMT::Device target_device{};
-  for (unsigned i = 0; i < adapter_count; i++) {
-    if (registry_id == devices.object(i).registryID()) {
-      target_device = devices.object(i);
-      break;
-    }
-  }
-  if (!target_device)
-    return NVAPI_INVALID_ARGUMENT;
-
-  *reinterpret_cast<LUID *>(pOSAdapterId) = GetAdapterLuid(target_device);
   return NVAPI_OK;
 }
 
 NVAPI_INTERFACE
 NvAPI_GPU_GetLogicalGpuInfo(NvLogicalGpuHandle hLogicalGpu, NV_LOGICAL_GPU_DATA *pLogicalGpuData) {
-  if (!pLogicalGpuData)
+  if (!pLogicalGpuData || !pLogicalGpuData->pOSAdapterId)
     return NVAPI_INVALID_ARGUMENT;
 
-  auto registry_id = uint64_t(hLogicalGpu);
-  auto devices = WMT::CopyAllDevices();
-  auto adapter_count = devices.count();
-  if (adapter_count == 0)
-    return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
-
-  WMT::Device target_device{};
-  for (unsigned i = 0; i < adapter_count; i++) {
-    if (registry_id == devices.object(i).registryID()) {
-      target_device = devices.object(i);
-      break;
-    }
-  }
-  if (!target_device)
-    return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
-
-  switch (pLogicalGpuData->version) {
-  case NV_LOGICAL_GPU_DATA_VER1:
-    pLogicalGpuData->physicalGpuCount = 1;
-    memset(pLogicalGpuData->physicalGpuHandles, 0, sizeof(pLogicalGpuData->physicalGpuHandles));
-    pLogicalGpuData->physicalGpuHandles[0] = (NvPhysicalGpuHandle)registry_id;
-    *reinterpret_cast<LUID *>(pLogicalGpuData->pOSAdapterId) = GetAdapterLuid(target_device);
-    break;
-  default:
+  if (pLogicalGpuData->version != NV_LOGICAL_GPU_DATA_VER1)
     return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
-  }
 
+  auto registry_id = uint64_t(hLogicalGpu);
+  LUID luid;
+  if (!GetAdapterLuid(registry_id, &luid))
+    return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
+
+  pLogicalGpuData->physicalGpuCount = 1;
+  memset(pLogicalGpuData->physicalGpuHandles, 0, sizeof(pLogicalGpuData->physicalGpuHandles));
+  pLogicalGpuData->physicalGpuHandles[0] = (NvPhysicalGpuHandle)registry_id;
+  *reinterpret_cast<LUID *>(pLogicalGpuData->pOSAdapterId) = luid;
   return NVAPI_OK;
 }
 

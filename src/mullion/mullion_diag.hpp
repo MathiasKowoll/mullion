@@ -132,6 +132,29 @@ Write(const std::string &lines) {
     ERR("Mullion profile: record could not be written");
 }
 
+// a line of a thread that may write thousands a frame (a span of each list recorded, submitted or encoded): a write
+// costs some microseconds, so a thread's lines are written together, at the latest with the first it adds 100 ms
+// after the oldest, or as the thread ends. `now` is diag::Now()
+inline void
+Later(const std::string &line, uint64_t now) {
+  struct Lines {
+    std::string text;
+    uint64_t since = 0;
+    ~Lines() {
+      if (!text.empty())
+        Write(text);
+    }
+  };
+  static thread_local Lines lines;
+  if (lines.text.empty())
+    lines.since = now;
+  lines.text += line;
+  if (lines.text.size() >= 16384 || now - lines.since >= 100'000'000) {
+    Write(lines.text);
+    lines.text.clear();
+  }
+}
+
 // the bridge's calls since the frame before: a 'call' line naming each code once, then 'unix' with code:count:time
 inline std::string
 Calls() {

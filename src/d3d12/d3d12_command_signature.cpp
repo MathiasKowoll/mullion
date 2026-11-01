@@ -43,6 +43,7 @@ struct mullion_compute_command_data {
   device ulong *statistics;
   packed_uint2 execution_range;
   device packed_uint3 * dispatches;
+  device ulong * rootsig_template;
 };
 
 struct d3d12_draw_arguments {
@@ -130,6 +131,9 @@ struct mullion_render_command_data {
   device uint *so_lacked;
   uint statistics_first, statistics_step, statistics_cut, statistics_cuts;
   packed_uint2 execution_range;
+  device ulong * rootsig_template;
+  device uint4 * vertex_template;
+  device uint * draw_arguments;
 };
 
 )";
@@ -380,6 +384,7 @@ public:
     };
     CommandType = side_effect;
     UpdateIndexBuffer = ib_index != ~0u;
+    ByteStride = pDesc->ByteStride;
 
     source << "[[kernel]] void resolve_indirect_commands([[thread_position_in_grid]] uint x, device "
            << (is_compute ? "mullion_compute_command_data" : "mullion_render_command_data")
@@ -437,10 +442,19 @@ public:
     source << "if (i >= count) return;\n";
     source << "device ulong * rootsig_qwords = command_data.rootsig_qwords + "
               "(i * command_data.rootsig_qwords_stride);\n";
+    // a command's own tables start as the list's
+    if (UpdateRootArguments)
+      source << "if (command_data.rootsig_template)\n"
+                "for (uint q = 0; q < command_data.rootsig_qwords_stride; q++) "
+                "rootsig_qwords[q] = command_data.rootsig_template[q];\n";
     if (!is_compute)
       source << "device mullion_vertex_buffer * vertex_buffer = "
                 "reinterpret_cast<device mullion_vertex_buffer *>(command_data.vertex_buffer + "
                 "(i * command_data.vertex_argbuf_stride));\n";
+    if (UpdateVertexBuffers)
+      source << "if (command_data.vertex_template)\n"
+                "for (uint q = 0; q < command_data.vertex_argbuf_stride / 16; q++) "
+                "reinterpret_cast<device uint4 *>(vertex_buffer)[q] = command_data.vertex_template[q];\n";
 
     // the caller binds what an IndirectMeshDraw's stages read; a command of the indirect command buffer binds its own
     if (!is_compute)
@@ -639,6 +653,39 @@ public:
     source << "}\n"
               "};\n";
 
+    // a signature of indexed draws alone: each command as four draws of Metal's (MTLDrawIndexedPrimitivesIndirectArguments,
+    // five words each), the indices inside the view, those inside where the byte address wraps, and the zeros past
+    // the view of each, as the indirect command buffer's commands are (resolve_indirect_commands); none past the count
+    bool draw_arguments = indexed && !UpdateRootArguments && !UpdateVertexBuffers && ib_index == ~0u;
+    if (draw_arguments)
+      source << "[[kernel]] void resolve_indirect_draw_arguments([[thread_position_in_grid]] uint x,\n"
+                "device mullion_render_command_data &command_data [[buffer(30)]]) {\n"
+                "ulong i = x;\n"
+                "if (i >= command_data.max_count) return;\n"
+                "uint count = command_data.max_count_buffer ? command_data.max_count_buffer[0] : command_data.max_count;\n"
+                "device uint *draws = command_data.draw_arguments + i * 20;\n"
+                "for (uint word = 0; word < 20; word++) draws[word] = 0;\n"
+                "if (i >= count) return;\n"
+                "device d3d12_arguments &arg = reinterpret_cast<device d3d12_arguments *>(command_data.argument_buffer + i * "
+             << pDesc->ByteStride << ")[0];\n"
+                "uint ib_size = command_data.index_buffer_format == 42 ? sizeof(uint) : sizeof(ushort);\n"
+                "uint ib_there = command_data.index_buffer_size / ib_size;\n"
+                "ulong period = (ulong(1) << 32) / ib_size, indices = arg.draw_indexed.index_count_per_instance;\n"
+                "uint start = uint(arg.draw_indexed.start_index_location % period);\n"
+                "uint before = uint(min(indices, period - start)), after = uint(indices - before);\n"
+                "uint inside = start < ib_there ? min(before, ib_there - start) : 0, wrapped_inside = min(after, ib_there);\n"
+                "uint counts[4] = {inside, wrapped_inside, min(before - inside, command_data.zero_count),\n"
+                "                  min(after - wrapped_inside, command_data.zero_count)};\n"
+                "for (uint k = 0; k < 4; k++) {\n"
+                "if (!counts[k] || !arg.draw_indexed.instance_count) continue;\n"
+                "draws[k * 5] = counts[k];\n"
+                "draws[k * 5 + 1] = arg.draw_indexed.instance_count;\n"
+                "draws[k * 5 + 2] = k == 0 ? start : 0;\n"
+                "draws[k * 5 + 3] = uint(arg.draw_indexed.base_vertex_location);\n"
+                "draws[k * 5 + 4] = arg.draw_indexed.start_instance_location;\n"
+                "}\n"
+                "}\n";
+
     if (indexed) {
       source << "[[kernel]] void count_indirect_strips(device mullion_render_command_data &data [[buffer(30)]],\n"
                 "uint3 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_threadgroup]],\n"
@@ -698,6 +745,16 @@ public:
     if (err) {
       ERR("Failed to compile command signature resolve pso: ", err.description().getUTF8String());
       return E_FAIL;
+    }
+
+    if (draw_arguments) {
+      auto arguments = lib.newFunction("resolve_indirect_draw_arguments");
+      if (arguments)
+        draw_arguments_resolver = device_->GetMTLDevice().newComputePipelineState(arguments, err);
+      if (!draw_arguments_resolver) {
+        ERR("Failed to compile command signature draw arguments pso");
+        return E_FAIL;
+      }
     }
 
     return S_OK;

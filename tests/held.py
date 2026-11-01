@@ -6,7 +6,9 @@ without the profile and says so in 'fact' lines:
 gpu: the GPU holds each frame; the tool's GPU time in each frame is at least the program's own timestamp difference
 of the frame's draw, and the frame's bound is the GPU when the draw took longer than the program's own time outside
 its submission and Present ('fact app'), and the application otherwise (as a first frame is, starting Wine's window).
-app: the program sleeps with nothing on the GPU; the tool gives the application at least that sleep in each frame.
+app: the program sleeps with nothing on the GPU; the GPU idles longest for the application in each frame, which has
+at least 90% of the sleep: Mullion's own thread may still encode the frame before during it (D3D11), and holds the
+GPU's idle while it does.
 hitch: the middle frame makes new pipelines; the tool counts that frame a hitch, and conversion or pipeline making
 is among the bridge calls that took it longest.
 events: each frame draws in the application's events "frame" and, inside it, "draw <frame>", which D3D12 gives in
@@ -18,6 +20,13 @@ GPU time, and together they cover the command buffer's own GPU span (gpuStartTim
 gives), as a sum on Metal 4, whose passes the profile times back to back, and as a union on Metal 3, whose stages
 overlap. a chained frame has a pass for each dispatch's event.
 
+bounds (tests/d3d12/d3d12_frame_bounds.cpp): phases of frames whose GPU idles for a known reason; each phase's
+frames but its first two, which the phase before still holds, must have the verdict the program built: cpu, the
+application's (it sleeps before it submits); gpu, the GPU's; overlap, the GPU's with the direct and compute queues
+running together at least half the shorter dispatch; gate, a Wait's (the direct queue's work waits for the compute
+queue's fence, which the program signals after a sleep); submit, not the GPU's, with each frame's 384 submissions
+counted. FRACTION of a phase's frames may differ, as a phase's frames are frames of a real display.
+
 the first frame is not judged: it has no frame before it to start from (mullion-diag, bounds).
 """
 import argparse
@@ -26,6 +35,7 @@ import importlib.util
 import re
 import shutil
 import sys
+from collections import Counter
 from pathlib import Path
 
 import run
@@ -41,6 +51,30 @@ MODES = ("gpu", "app", "hitch", "events")
 # may miss or count twice
 PASSES = {"passes": ["48", "120", "mixed"], "chained": ["48", "120", "chained"]}
 SPAN = 0.02
+# the share of a bounds phase's frames that must have the phase's verdict
+FRACTION = 0.8
+
+
+def judge_bounds(facts, record):
+    """each phase's frames against what the program built, one line for each thing wrong"""
+    rows = {row["frame"]: row for row in tool.bounds(record)}
+    wrong = [] if rows else ["the tool found no frames to judge"]
+    for (first, last), name in facts["phase"]:
+        judged = [rows[f] for f in range(first + 2, last + 1) if f in rows]
+        if name == "overlap":
+            # the shorter dispatch is 12 ms by the program's own timing ('fact turns')
+            good = [row["verdict"] == "gpu" and row["overlap"] >= 6_000_000 for row in judged]
+        elif name == "submit":
+            good = [row["verdict"] != "gpu" for row in judged]
+            submits = sum(row["cpu"].get("submits", 0) for row in judged) / max(len(judged), 1)
+            if not 0.9 * 384 <= submits <= 1.1 * 384:
+                wrong.append(f"submit: {submits:.1f} submissions a frame, the program made 384")
+        else:
+            good = [row["verdict"] == {"cpu": "application"}.get(name, name) for row in judged]
+        if sum(good) < FRACTION * len(judged) or not judged:
+            wrong.append(f"{name}: {sum(good)} of {len(judged)} frames have the verdict built, the verdicts "
+                         f"{Counter(row['verdict'] for row in judged)}, overlaps {[row['overlap'] for row in judged][:4]}")
+    return wrong
 
 
 def judge_passes(facts, record, metal4):
@@ -65,6 +99,16 @@ def judge_passes(facts, record, metal4):
     return wrong
 
 
+def bounds_facts(text):
+    """d3d12_frame_bounds's 'fact' lines: phase <first> <last> <name>, turns <ns>, frame <frame> <ns>"""
+    facts = {}
+    for kind, rest in re.findall(r"^fact (\w+) (.*)$", text, re.M):
+        words = rest.split()
+        facts.setdefault(kind, []).append(((int(words[0]), int(words[1])), words[2]) if kind == "phase"
+                                          else tuple(int(word) for word in words))
+    return facts
+
+
 def judge(mode, facts, record):
     """what the tool got wrong about the run, one line each"""
     rows = {row["frame"]: row for row in tool.bounds(record)}
@@ -80,8 +124,9 @@ def judge(mode, facts, record):
     elif mode == "app":
         slept, = facts["sleep"]
         for frame, row in rows.items():
-            if row["causes"]["application"] < slept:
-                wrong.append(f"frame {frame}: application {row['causes']['application']} ns of a {slept} ns sleep")
+            if row["causes"]["application"] < 0.9 * slept or row["verdict"] != "application":
+                wrong.append(f"frame {frame}: application {row['causes']['application']} ns of a {slept} ns sleep, "
+                             f"verdict {row['verdict']}")
     elif mode == "events":
         for frame, encoding in facts["event"].items():
             named = {record.events.get((p.queue, p.cmdbuf, p.number)) for p in record.passes_in(frame)
@@ -147,6 +192,19 @@ def main():
             failed += bool(wrong)
             print(f"d3d12_passes {mode}: {'failed' if wrong else 'passed'}", *(f"  {line}" for line in wrong[:8]),
                   sep="\n", flush=True)
+        exe = next(path for build in builds for path in build.glob("tests/*/d3d12_frame_bounds.exe"))
+        out = (args.out / "d3d12_frame_bounds").resolve()
+        shutil.rmtree(out, ignore_errors=True)
+        out.mkdir(parents=True)
+        env = dict(base, MULLION_DIAG="profile", MULLION_DIAG_PATH=str(out))
+        status = run.finish([binary, exe, "dxil", "24"], env, args.seconds, out / "log.txt")
+        records = sorted(out.glob("*.diag"))
+        wrong = ([f"exit status {status}"] if status else []) + (
+            judge_bounds(bounds_facts((out / "log.txt").read_text(errors="replace")), tool.Record(records[-1]))
+            if len(records) == 1 else [f"{len(records)} records"])
+        failed += bool(wrong)
+        print(f"d3d12_frame_bounds: {'failed' if wrong else 'passed'}", *(f"  {line}" for line in wrong[:8]),
+              sep="\n", flush=True)
         sys.exit(failed != 0)
 
 

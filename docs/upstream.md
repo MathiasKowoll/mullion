@@ -172,3 +172,11 @@ Commits on main that neither upstream has, oldest first.
 | `2a323ca` | tests: held.py checks the profile's passes against command buffer spans |
 | `43f3bb2` | nvapi: a function it does not implement is named once |
 | `8bd6b15` | d3d12: the recording arena's mappings begin where it begins |
+| `0b71541` | nvapi: a GPU's adapter ID is its DXGI adapter's LUID |
+| `84e4902` | d3d12: a refused state object says why, and leaves what it was made of (branch `rtpso-raygen`) |
+| `b7b3043` | d3d12: a pipeline refused for its sample count says the count (branch `rtpso-raygen`) |
+| `722ba52` | d3d12: a profile records what each frame's submissions wait on (branch `frame-profile`; DXMT has no profiler to map it to) |
+| `00d2609` | tools: mullion-diag judges each frame by the GPU's idle time (branch `frame-profile`) |
+| `7c239fa` | tests: held.py checks the frame verdict against frames of known bounds (branch `frame-profile`) |
+| `6467544` | tests: the perf probe pairs ExecuteIndirect calls with the same work issued directly (branch `indirect-cost`) |
+| `8649192` | d3d12: ExecuteIndirect of a few dispatches or draws runs them as Metal's own (branch `indirect-cost`) |

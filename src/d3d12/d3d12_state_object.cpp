@@ -7,11 +7,16 @@
 #include "com/com_pointer.hpp"
 #include "util_md5.hpp"
 #include "sha1/sha1_util.hpp"
+#include "util_env.hpp"
 #include <algorithm>
+#include <fstream>
 #include <map>
+#include <set>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -32,8 +37,94 @@ ExportName(std::string_view function) {
   return std::wstring(function.begin(), function.end());
 }
 
+// MULLION_DIAG_PATH: where a refused state object's DXIL libraries and root signatures are written, as <sha1>.dxil
+// and <sha1>.rootsig, with a <sha1>.txt that says what the state object was made of and why it was refused. a
+// Windows path, or a macOS one through Wine's Z: drive, as the trace log's (trace::WindowsDirectory)
+const std::string &
+DiagDirectory() {
+  static const std::string directory = [] {
+    auto given = env::getEnvVar("MULLION_DIAG_PATH");
+    return given.empty() || given[0] != '/' ? given : "Z:" + given;
+  }();
+  return directory;
+}
+
+// what a process writes there at most: enough for the libraries of a few dozen refused pipelines
+constexpr uint64_t kDiagBudget = 8 << 20;
+
+// writes a file there once: Written, or Had when an earlier call wrote it
+enum DiagWritten { NotWritten, Written, Had };
+DiagWritten
+DiagWrite(const std::string &file, const void *data, size_t size) {
+  static std::mutex mutex;
+  static std::unordered_set<std::string> written;
+  static uint64_t total = 0;
+  static bool full = false;
+  std::lock_guard lock(mutex);
+  if (written.count(file))
+    return Had;
+  if (total + size > kDiagBudget) {
+    if (!std::exchange(full, true))
+      ERR("CreateStateObject: MULLION_DIAG_PATH has the ", kDiagBudget >> 20, " MB this process may write; no more");
+    return NotWritten;
+  }
+  std::ofstream out(DiagDirectory() + "\\" + file, std::ios::binary);
+  if (!out.write((const char *)data, size)) {
+    ERR("CreateStateObject: could not write ", file, " to MULLION_DIAG_PATH");
+    return NotWritten;
+  }
+  written.insert(file);
+  total += size;
+  return Written;
+}
+
+std::string
+Narrow(std::wstring_view name) {
+  std::string out;
+  for (auto c : name)
+    out.push_back(c < 0x80 ? (char)c : '?');
+  return out;
+}
+
+const char *
+KindName(uint32_t kind) {
+  switch (kind) {
+  case SM50_RAY_SHADER_RAY_GENERATION:
+    return "ray generation shader";
+  case SM50_RAY_SHADER_INTERSECTION:
+    return "intersection shader";
+  case SM50_RAY_SHADER_ANY_HIT:
+    return "any hit shader";
+  case SM50_RAY_SHADER_CLOSEST_HIT:
+    return "closest hit shader";
+  case SM50_RAY_SHADER_MISS:
+    return "miss shader";
+  case SM50_RAY_SHADER_CALLABLE:
+    return "callable shader";
+  default:
+    return "export";
+  }
+}
+
+// what a refusal is about: an export of a kind, or the state object as a whole
+std::string
+Subject(const std::wstring &name, uint32_t kind) {
+  return name.empty() && !kind ? "the state object" : str::format(KindName(kind), " \"", Narrow(name), "\"");
+}
+
+// why a state object is refused: the export, its kind (SM50_RAY_SHADER_KIND, or 0), the step that refused it
+// ("library", "compile", "validation" or "unresolved association") and what that step said
+struct Refusal {
+  std::wstring name;
+  uint32_t kind;
+  const char *step;
+  std::string text;
+};
+
 struct RayLibrary {
   sm50_shader_t shader = nullptr;
+  // the container itself, kept only for MULLION_DIAG_PATH: a pipeline refused for a collection's shader writes it
+  std::string bytes;
   ~RayLibrary() {
     if (shader)
       SM50Destroy(shader);
@@ -218,6 +309,22 @@ class MTLD3D12StateObjectImpl : public MTLD3D12DeviceChild<MTLD3D12StateObject, 
   std::unordered_map<std::wstring, Association> library_definitions_;
   std::unordered_set<std::wstring> library_names_;
 
+  // why this state object is refused. the log has each distinct cause once a process, with the first export it was
+  // found for: a pipeline of many shaders, and an application that tries the same one again, say it once
+  std::vector<Refusal> refusals_;
+
+  void
+  Refuse(const char *step, const std::wstring &export_name, uint32_t kind, std::string text) {
+    static std::mutex mutex;
+    static std::set<std::tuple<std::string, uint32_t, std::string>> said;
+    {
+      std::lock_guard lock(mutex);
+      if (said.insert({step, kind, text}).second)
+        ERR("CreateStateObject: ", step, " refused ", Subject(export_name, kind), ": ", text);
+    }
+    refusals_.push_back({export_name, kind, step, std::move(text)});
+  }
+
   struct Pipeline {
     WMT::Reference<WMT::ComputePipelineState> pipeline;
     WMT::Reference<WMT::VisibleFunctionTable> table;
@@ -257,16 +364,23 @@ class MTLD3D12StateObjectImpl : public MTLD3D12DeviceChild<MTLD3D12StateObject, 
       const D3D12_DXIL_LIBRARY_DESC &desc, std::vector<std::pair<const RayLibrary *, LibrarySubobject>> &subobjects
   ) {
     auto library = std::make_shared<RayLibrary>();
-    if (!ShaderContainerHolds(desc.DXILLibrary.pShaderBytecode, desc.DXILLibrary.BytecodeLength) ||
-        !ShaderFeaturesSupported(device_, desc.DXILLibrary.pShaderBytecode, desc.DXILLibrary.BytecodeLength))
+    if (!ShaderContainerHolds(desc.DXILLibrary.pShaderBytecode, desc.DXILLibrary.BytecodeLength)) {
+      Refuse("library", {}, 0, "the DXIL library is not a container, or its hash is not the one it carries");
       return FAIL(E_INVALIDARG);
+    }
+    if (!ShaderFeaturesSupported(device_, desc.DXILLibrary.pShaderBytecode, desc.DXILLibrary.BytecodeLength)) {
+      Refuse("library", {}, 0, "the DXIL library requires a shader feature the device does not report");
+      return FAIL(E_INVALIDARG);
+    }
     SM50Error error;
     if (SM50Initialize(
             desc.DXILLibrary.pShaderBytecode, desc.DXILLibrary.BytecodeLength, &library->shader, nullptr, &error
         )) {
-      ERR("CreateStateObject: a DXIL library is not usable: ", SM50GetErrorMessageString(error));
+      Refuse("library", {}, 0, std::string("not usable: ") + SM50GetErrorMessageString(error));
       return E_INVALIDARG;
     }
+    if (!DiagDirectory().empty())
+      library->bytes.assign((const char *)desc.DXILLibrary.pShaderBytecode, desc.DXILLibrary.BytecodeLength);
     std::unordered_map<std::wstring, RayShader> shaders;
     char name[1024];
     SM50_RAY_SHADER_INFO info;
@@ -310,11 +424,12 @@ class MTLD3D12StateObjectImpl : public MTLD3D12DeviceChild<MTLD3D12StateObject, 
     return root;
   }
 
-  // `libraries`: those whose functions the shader may call
+  // `libraries`: those whose functions the shader may call. `why` says what the converter or Metal said when it fails;
+  // `unresolved` that the shader needs a function or a binding that its state object may yet get
   std::shared_ptr<RayFunction>
   Compile(
       const RayShader &shader, ID3D12RootSignature *pGlobal, ID3D12RootSignature *pLocal,
-      std::span<const sm50_shader_t> libraries, bool &unresolved
+      std::span<const sm50_shader_t> libraries, bool &unresolved, std::string &why
   ) {
     auto blob = [](ID3D12RootSignature *root, SM50_SHADER_COMPILATION_ARGUMENT_TYPE type, void *next) {
       SM50_SHADER_ROOT_SIGNATURE_DATA data{next, type};
@@ -343,8 +458,7 @@ class MTLD3D12StateObjectImpl : public MTLD3D12DeviceChild<MTLD3D12StateObject, 
             shader.library->shader, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&common, name.c_str(), &bitcode, &error
         )) {
       unresolved = result == SM50_COMPILE_UNRESOLVED;
-      if (!unresolved)
-        ERR("CreateStateObject: failed to compile ", shader.function, ": ", SM50GetErrorMessageString(error));
+      why = (unresolved ? "unresolved, " : "") + std::string(SM50GetErrorMessageString(error));
       return nullptr;
     }
     SM50_COMPILED_BITCODE compiled;
@@ -354,8 +468,7 @@ class MTLD3D12StateObjectImpl : public MTLD3D12DeviceChild<MTLD3D12StateObject, 
     if (library)
       function->function = library.newFunction(name.c_str());
     if (!function->function) {
-      ERR("CreateStateObject: no Metal function for ", shader.function, ": ",
-          err ? err.description().getUTF8String() : "the library has none of its name");
+      why = std::string("Metal: ") + (err ? err.description().getUTF8String() : "the library has none of its name");
       return nullptr;
     }
     return function;
@@ -373,8 +486,10 @@ public:
     type_ = pDesc->Type;
     libraries_.clear();
     if (pParent) {
-      if (type_ != D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE || pParent->type_ != type_)
+      if (type_ != D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE || pParent->type_ != type_) {
+        Refuse("validation", {}, 0, "an addition is a raytracing pipeline that grows a raytracing pipeline");
         return FAIL(E_INVALIDARG);
+      }
       if (device_->NamesPasses())
         name = pParent->name;
       shaders_ = pParent->shaders_;
@@ -425,10 +540,18 @@ public:
              !memcmp(first, second, size);
     };
     bool failed = false;
-    auto configuration = [&](SubobjectKind of, const std::pair<uint32_t, uint32_t> &values) {
+    auto config_name = [](unsigned of) {
+      const char *names[] = {"global root signature", "local root signature", "shader config", "pipeline config"};
+      return of < std::size(names) ? names[of] : "subobject";
+    };
+    // `name` and `kind`: the export whose config it is, or none for a collection's
+    auto configuration = [&](SubobjectKind of, const std::pair<uint32_t, uint32_t> &values, const std::wstring &name,
+                             uint32_t kind) {
       auto &seen = configurations_[of - ShaderConfig];
       if (seen && *seen != values) {
-        ERR("CreateStateObject: ray tracing configurations do not match across exports");
+        Refuse("validation", name, kind,
+               str::format("its ", config_name(of), " (", values.first, ", ", values.second, ") is not the (",
+                           seen->first, ", ", seen->second, ") of the state object's other exports"));
         failed = true;
       }
       seen = values;
@@ -467,7 +590,7 @@ public:
             configured.insert(shader.library.get());
           for (unsigned of = ShaderConfig; of < SubobjectKinds; of++)
             if (auto &config = collection->configurations_[of - ShaderConfig]; config)
-              configuration((SubobjectKind)of, *config);
+              configuration((SubobjectKind)of, *config, L"(a collection)", 0);
         }
         root_signatures_.insert(
             root_signatures_.end(), collection->root_signatures_.begin(), collection->root_signatures_.end()
@@ -544,7 +667,7 @@ public:
       case D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE: {
         auto root = RootSignature(subobject.bytes);
         if (!root) {
-          ERR("CreateStateObject: a DXIL library's root signature is not usable");
+          Refuse("library", subobject.name, 0, "the library's root signature of this name is not usable");
           return E_INVALIDARG;
         }
         root_signatures_.push_back(static_cast<MTLD3D12RootSignature *>(root.ptr()));
@@ -617,14 +740,18 @@ public:
       } else if (library_names_.count(association.subobject)) {
         association.subobject.clear();
       } else if (type_ == D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE) {
-        ERR("CreateStateObject: an association names a subobject that no DXIL library defines");
+        Refuse("unresolved association", association.name, 0,
+               "an association names the subobject \"" + Narrow(association.subobject) +
+                   "\", which no library defines");
         return E_INVALIDARG;
       }
     }
 
     if (pParent && (!(flags_ & D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS) ||
-                    !(pParent->flags_ & D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS)))
+                    !(pParent->flags_ & D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS))) {
+      Refuse("validation", {}, 0, "an addition and the state object it grows must both allow additions");
       return FAIL(E_INVALIDARG);
+    }
     deferred_ = type_ == D3D12_STATE_OBJECT_TYPE_COLLECTION &&
                 (flags_ & D3D12_STATE_OBJECT_FLAG_ALLOW_LOCAL_DEPENDENCIES_ON_EXTERNAL_DEFINITIONS);
     if (type_ == D3D12_STATE_OBJECT_TYPE_COLLECTION) {
@@ -646,6 +773,8 @@ public:
     // state object's associations "do not override any existing associations in contained collections". one of its
     // own that names the shader is a conflict with one of the collection's that does, and stands where the
     // collection gave the shader only a default
+    // the subobject an association names that no library here defines, for the log
+    std::wstring missing_subobject;
     auto resolve = [&](SubobjectKind of, const std::wstring &name, const RayShader &shader, const std::wstring *group) {
       auto source = ExportName(shader.function);
       const Association *best[2] = {};
@@ -661,7 +790,10 @@ public:
         auto &strongest = best[scope];
         if (!applies(a))
           continue;
-        unresolved |= !a.subobject.empty();
+        if (!a.subobject.empty()) {
+          unresolved = true;
+          missing_subobject = a.subobject;
+        }
         if (a.kind != of)
           continue;
         if (!strongest || a.strength > strongest->strength) {
@@ -673,19 +805,24 @@ public:
       for (unsigned i = 0; i < std::size(best); i++)
         if (ambiguous[i]) {
           if (!best[i]->name.empty()) {
-            ERR("CreateStateObject: conflicting explicit subobject associations");
+            Refuse("validation", name, shader.info.kind,
+                   str::format("two associations that name it give it different ", config_name(of), "s"));
             failed = true;
           }
           best[i] = nullptr;
         }
       auto [outer, inner] = best;
       if (!outer || !inner) {
-        if (!outer && !inner && of >= ShaderConfig && (ambiguous[0] || ambiguous[1]))
+        if (!outer && !inner && of >= ShaderConfig && (ambiguous[0] || ambiguous[1])) {
+          Refuse("validation", name, shader.info.kind,
+                 str::format("two default associations give it different ", config_name(of), "s"));
           failed = true;
+        }
         return outer ? outer : inner;
       }
       if (!outer->name.empty() && !inner->name.empty() && !same(*outer, *inner)) {
-        ERR("CreateStateObject: a subobject association conflicts with its collection's");
+        Refuse("validation", name, shader.info.kind,
+               str::format("an association gives it a ", config_name(of), " other than its collection's"));
         failed = true;
       }
       return outer->name.empty() ? inner : outer;
@@ -698,13 +835,13 @@ public:
           if (inherited && configurations_[of - ShaderConfig])
             continue;
           unresolved = true;
-          if (!deferred_) {
-            ERR("CreateStateObject: a ray tracing shader has no unambiguous configuration");
+          if (!deferred_ && !failed) {
+            Refuse("validation", name, shader.info.kind, str::format("no ", config_name(of), " is associated with it"));
             failed = true;
           }
           continue;
         }
-        configuration((SubobjectKind)of, config->values);
+        configuration((SubobjectKind)of, config->values, name, shader.info.kind);
       }
     };
     // a shader compiles once for each pair of root signatures it is used with
@@ -715,7 +852,8 @@ public:
       auto shader = shaders_.find(name);
       if (shader == shaders_.end()) {
         if (!deferred_) {
-          ERR("CreateStateObject: a hit group imports a shader that no library exports");
+          Refuse("validation", group ? *group : name, 0,
+                 "the hit group imports \"" + Narrow(name) + "\", which no library exports");
           failed = true;
         }
         return false;
@@ -729,6 +867,9 @@ public:
       auto global = global_association ? global_association->root : nullptr,
            local = local_association ? local_association->root : nullptr;
       if (failed || unresolved) {
+        if (!failed && !deferred_)
+          Refuse("unresolved association", name, shader->second.info.kind,
+                 "an association names the subobject \"" + Narrow(missing_subobject) + "\", which no library defines");
         failed |= !deferred_;
         return false;
       }
@@ -737,8 +878,12 @@ public:
           same({Local, local}, {Local, previous->local}))
         return true;
       auto &made = compiled[{shader->second.library->shader, shader->second.function, global, local}];
-      if (!made && !(made = Compile(shader->second, global, local, linkable, unresolved))) {
-        failed |= !deferred_ || !unresolved;
+      std::string why;
+      if (!made && !(made = Compile(shader->second, global, local, linkable, unresolved, why))) {
+        if (!deferred_ || !unresolved) {
+          Refuse("compile", name, shader->second.info.kind, why);
+          failed = true;
+        }
         return false;
       }
       if (previous)
@@ -762,6 +907,10 @@ public:
         if (configured.count(shader.library.get())) {
           unresolved = false;
           validate(name, shader, nullptr, configured.count(shader.library.get()));
+          if (unresolved && !deferred_ && !failed)
+            Refuse("unresolved association", name, shader.info.kind,
+                   "an association names the subobject \"" + Narrow(missing_subobject) +
+                       "\", which no library defines");
           failed |= unresolved && !deferred_;
         } else {
           RayExport checked;
@@ -771,7 +920,7 @@ public:
     }
     for (auto &group : hit_groups) {
       if (exports_.count(group.name)) {
-        ERR("CreateStateObject: two exports have a hit group's name");
+        Refuse("validation", group.name, 0, "another export has the hit group's name");
         return E_INVALIDARG;
       }
       RayExport to;
@@ -786,8 +935,11 @@ public:
     }
     if (type_ == D3D12_STATE_OBJECT_TYPE_COLLECTION)
       deferred_associations_ = std::move(associations);
-    if (failed)
+    if (failed) {
+      if (refusals_.empty())
+        Refuse("validation", {}, 0, "refused without a cause it could name");
       return FAIL(E_INVALIDARG);
+    }
     if (auto &config = configurations_[PipelineConfig - ShaderConfig]; config)
       pipeline_config_ = {config->first, (D3D12_RAYTRACING_PIPELINE_FLAGS)config->second};
 
@@ -815,6 +967,128 @@ public:
     if (device_->NamesPasses() && type_ == D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE)
       device_->PipelineMade(name, "ray", start);
     return S_OK;
+  }
+
+  // MULLION_DIAG_PATH: what a refused state object was made of, to make it again outside the application. its
+  // libraries, those of its collections and its root signatures are written by their SHA-1, and a <sha1>.txt says
+  // which subobjects named them and why the state object was refused
+  void
+  WriteRefusal(const D3D12_STATE_OBJECT_DESC &desc) {
+    if (DiagDirectory().empty())
+      return;
+    auto library = [&](const void *data, size_t size) {
+      auto hash = Sha1HashState::compute(data, size).string();
+      return hash + (DiagWrite(hash + ".dxil", data, size) ? ".dxil" : ".dxil (not written)");
+    };
+    auto root = [&](ID3D12RootSignature *root) -> std::string {
+      if (!root)
+        return "none";
+      const void *data;
+      size_t size = static_cast<MTLD3D12RootSignature *>(root)->GetBlob(&data);
+      auto hash = Sha1HashState::compute(data, size).string();
+      return hash + (DiagWrite(hash + ".rootsig", data, size) ? ".rootsig" : ".rootsig (not written)");
+    };
+    auto names = [](const WCHAR *const *names, UINT count) {
+      std::string out;
+      for (auto name : std::span(names, count))
+        out += str::format(" \"", Narrow(name ? name : L""), "\"");
+      return count ? out : std::string(" (every export: a default)");
+    };
+    auto exports = [](const D3D12_EXPORT_DESC *exports, UINT count) {
+      std::string out;
+      for (auto &e : std::span(exports, count))
+        out += str::format(
+            " \"", Narrow(e.Name ? e.Name : L""), "\"",
+            e.ExportToRename ? " from \"" + Narrow(e.ExportToRename) + "\"" : std::string()
+        );
+      return count ? out : std::string(" (all)");
+    };
+    auto subobjects = std::span(desc.pSubobjects, desc.NumSubobjects);
+    std::string text = str::format(
+        desc.Type == D3D12_STATE_OBJECT_TYPE_COLLECTION ? "collection" : "raytracing pipeline", ", ",
+        subobjects.size(), " subobjects\n"
+    );
+    for (auto &refusal : refusals_)
+      text += str::format(
+          "refused: ", refusal.step, ": ", Subject(refusal.name, refusal.kind), ": ", refusal.text, "\n"
+      );
+    for (size_t i = 0; i < subobjects.size(); i++) {
+      auto &subobject = subobjects[i];
+      text += str::format(i, ": ");
+      switch (subobject.Type) {
+      case D3D12_STATE_SUBOBJECT_TYPE_STATE_OBJECT_CONFIG:
+        text += str::format("state object config, flags ", (uint32_t)((const D3D12_STATE_OBJECT_CONFIG *)subobject.pDesc)->Flags);
+        break;
+      case D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE:
+      case D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE:
+        text += str::format(
+            subobject.Type == D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE ? "global" : "local", " root signature ",
+            root(((const D3D12_GLOBAL_ROOT_SIGNATURE *)subobject.pDesc)->pGlobalRootSignature)
+        );
+        break;
+      case D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY: {
+        auto &code = *(const D3D12_DXIL_LIBRARY_DESC *)subobject.pDesc;
+        text += "library " + library(code.DXILLibrary.pShaderBytecode, code.DXILLibrary.BytecodeLength) + ", exports" +
+                exports(code.pExports, code.NumExports);
+        break;
+      }
+      case D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION: {
+        auto &existing = *(const D3D12_EXISTING_COLLECTION_DESC *)subobject.pDesc;
+        auto collection = static_cast<MTLD3D12StateObjectImpl *>(existing.pExistingCollection);
+        text += "collection, exports" + exports(existing.pExports, existing.NumExports) + ", libraries";
+        for (auto &taken : collection->libraries_)
+          text += " " + (taken->bytes.empty() ? std::string("(not kept)") : library(taken->bytes.data(), taken->bytes.size()));
+        text += ", root signatures";
+        for (auto &taken : collection->root_signatures_)
+          text += " " + root(taken.ptr());
+        break;
+      }
+      case D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION: {
+        auto &association = *(const D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION *)subobject.pDesc;
+        auto at = association.pSubobjectToAssociate - desc.pSubobjects;
+        text += str::format("association of subobject ", at, " with") + names(association.pExports, association.NumExports);
+        break;
+      }
+      case D3D12_STATE_SUBOBJECT_TYPE_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION: {
+        auto &association = *(const D3D12_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION *)subobject.pDesc;
+        text += "association of library subobject \"" + Narrow(association.SubobjectToAssociate) + "\" with" +
+                names(association.pExports, association.NumExports);
+        break;
+      }
+      case D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG: {
+        auto &config = *(const D3D12_RAYTRACING_SHADER_CONFIG *)subobject.pDesc;
+        text += str::format("shader config, payload ", config.MaxPayloadSizeInBytes, ", attributes ",
+                            config.MaxAttributeSizeInBytes);
+        break;
+      }
+      case D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG:
+      case D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG1: {
+        auto &config = *(const D3D12_RAYTRACING_PIPELINE_CONFIG1 *)subobject.pDesc;
+        text += str::format(
+            "pipeline config, recursion ", config.MaxTraceRecursionDepth, ", flags ",
+            subobject.Type == D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG1 ? (uint32_t)config.Flags : 0u
+        );
+        break;
+      }
+      case D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP: {
+        auto &group = *(const D3D12_HIT_GROUP_DESC *)subobject.pDesc;
+        auto name = [](const WCHAR *import) { return import ? "\"" + Narrow(import) + "\"" : std::string("none"); };
+        text += str::format(
+            "hit group \"", Narrow(group.HitGroupExport ? group.HitGroupExport : L""), "\", type ", (uint32_t)group.Type,
+            ", closest hit ", name(group.ClosestHitShaderImport), ", any hit ", name(group.AnyHitShaderImport),
+            ", intersection ", name(group.IntersectionShaderImport)
+        );
+        break;
+      }
+      default:
+        text += str::format("subobject of type ", (uint32_t)subobject.Type);
+        break;
+      }
+      text += "\n";
+    }
+    auto hash = Sha1HashState::compute(text.data(), text.size()).string();
+    if (DiagWrite(hash + ".txt", text.data(), text.size()) == Written)
+      ERR("CreateStateObject: wrote what it refused to MULLION_DIAG_PATH as ", hash, ".txt");
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -934,8 +1208,10 @@ CreateStateObject(
     return FAIL(E_INVALIDARG);
   auto state = Com(new MTLD3D12StateObjectImpl(pDevice));
   HRESULT hr = state->Initialize(pDesc, static_cast<MTLD3D12StateObjectImpl *>(pParent));
-  if (FAILED(hr))
+  if (FAILED(hr)) {
+    state->WriteRefusal(*pDesc);
     return hr;
+  }
   return state->QueryInterface(riid, ppStateObject);
 }
 
