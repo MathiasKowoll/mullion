@@ -402,6 +402,8 @@ public:
   UINT UpdateRootArguments : 1;
   UINT UpdateVertexBuffers : 1;
   UINT UpdateIndexBuffer   : 1;
+  // the bytes from a command's arguments to the next one's (D3D12_COMMAND_SIGNATURE_DESC::ByteStride)
+  UINT ByteStride = 0;
   // what D3D12 resets after ExecuteIndirect: the root argument dwords the signature sets (constants become 0, root
   // views NULL), as (offset, count), and the vertex buffer slots it binds (NULL); the index buffer when it binds one
   std::vector<std::pair<uint32_t, uint32_t>> ResetRootDwords;
@@ -411,6 +413,9 @@ public:
   WMT::Reference<WMT::ComputePipelineState> render_resolver;
   virtual WMT::ComputePipelineState StatisticsResolver() = 0;
   WMT::Reference<WMT::ComputePipelineState> compute_resolver;
+  // a signature of indexed draws alone: the kernel that leaves each command's draws as Metal's indirect arguments
+  // (IndirectRenderCommandData::draw_arguments)
+  WMT::Reference<WMT::ComputePipelineState> draw_arguments_resolver;
 
   virtual void AddRefPrivate() = 0;
   virtual void ReleasePrivate() = 0;
