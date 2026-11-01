@@ -3633,15 +3633,185 @@ static std::vector<Scene> submit_scenes()
     };
 }
 
+// ExecuteIndirect against the same work issued directly, in pairs of scenes: NAME runs each call's commands through
+// ExecuteIndirect, NAME_direct as the Dispatch or DrawIndexedInstanced calls they stand for (none for a count of
+// zero). The work is tiny (a 64-thread group, a small triangle), so a pair's difference is what an ExecuteIndirect
+// call costs beyond its commands: (NAME - NAME_direct) / calls, on the CPU (record_us_per_call, work) and the GPU
+// (gputs). The patterns are UE5's: indirect dispatches, often with a count buffer; DrawIndexed with a large
+// MaxCommandCount and a small real count; root constants per command; and hundreds of small calls in one list.
+static std::vector<Scene> indirect_scenes()
+{
+    struct Pattern
+    {
+        const char *name, *desc;
+        bool draw, constants;
+        UINT max, count;
+        bool count_buffer;
+        UINT calls, barrier_every;
+        bool vertices = false;   // DRAW (DrawInstanced) in place of DRAW_INDEXED
+    };
+    static const Pattern patterns[] = {
+        { "ei_dispatch_m1", "200 indirect dispatches, MaxCommandCount 1, no count buffer", false, false, 1, 1, false, 200, 0 },
+        { "ei_dispatch_m1_c0", "200 indirect dispatches, MaxCommandCount 1, count buffer 0", false, false, 1, 0, true, 200, 0 },
+        { "ei_dispatch_m1_c1", "200 indirect dispatches, MaxCommandCount 1, count buffer 1", false, false, 1, 1, true, 200, 0 },
+        { "ei_dispatch_m64_c0", "200 indirect dispatch calls, MaxCommandCount 64, count buffer 0", false, false, 64, 0, true, 200, 0 },
+        { "ei_dispatch_m64_c1", "200 indirect dispatch calls, MaxCommandCount 64, count buffer 1", false, false, 64, 1, true, 200, 0 },
+        { "ei_dispatch_m64_c64", "200 indirect dispatch calls, MaxCommandCount 64, count buffer 64", false, false, 64, 64, true, 200, 0 },
+        { "ei_dxi_m4096_c10", "50 DrawIndexed calls, MaxCommandCount 4096, count buffer 10", true, false, 4096, 10, true, 50, 0 },
+        { "ei_rc_dxi_m4096_c10", "50 root constants + DrawIndexed calls, MaxCommandCount 4096, count buffer 10", true, true, 4096, 10, true, 50, 0 },
+        { "ei_many_dispatch", "400 indirect dispatches, MaxCommandCount 1, a UAV barrier every 8 (UE5's compute passes)", false, false, 1, 1, false, 400, 8 },
+        { "ei_many_draw", "400 DrawIndexed calls, MaxCommandCount 1 (UE5's instance-culled mesh draws)", true, false, 1, 1, false, 400, 0 },
+        { "ei_many_draw_vertices", "400 Draw calls (not indexed), MaxCommandCount 1", true, false, 1, 1, false, 400, 0, true },
+    };
+    struct State
+    {
+        ID3D12CommandSignature *sig = nullptr;
+        ID3D12Resource *args = nullptr, *count = nullptr;
+    };
+    static State states[std::size(patterns)];
+    static ID3D12PipelineState *compute_pso, *draw_pso;
+    static ID3D12Resource *indices;
+    static std::vector<std::string> names;
+    names.clear();
+    names.reserve(2 * std::size(patterns));
+
+    std::vector<Scene> v;
+    for (size_t n = 0; n < std::size(patterns); n++)
+    {
+        const Pattern &pat = patterns[n];
+        State &s = states[n];
+        auto init = [&pat, &s] {
+            compute_pso = create_compute_pso();
+            draw_pso = create_pso({});
+            if (!indices)
+            {
+                indices = create_buffer(256, D3D12_HEAP_TYPE_UPLOAD);
+                uint16_t *i; CHECK(indices->Map(0, nullptr, (void **)&i));
+                i[0] = 0; i[1] = 1; i[2] = 2;
+                indices->Unmap(0, nullptr);
+            }
+            D3D12_INDIRECT_ARGUMENT_DESC a[2] = {};
+            UINT k = 0, stride;
+            if (pat.constants)
+            {
+                a[k].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+                a[k++].Constant = { 0, 0, 4 };
+            }
+            a[k++].Type = pat.vertices ? D3D12_INDIRECT_ARGUMENT_TYPE_DRAW
+                          : pat.draw   ? D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED
+                                       : D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+            stride = (pat.constants ? 16 : 0) + (pat.vertices ? sizeof(D3D12_DRAW_ARGUMENTS)
+                                                 : pat.draw   ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS)
+                                                              : sizeof(D3D12_DISPATCH_ARGUMENTS));
+            D3D12_COMMAND_SIGNATURE_DESC cs = { stride, k, a, 0 };
+            CHECK(p.device->CreateCommandSignature(&cs, pat.constants ? p.root_signature : nullptr, IID_PPV_ARGS(&s.sig)));
+            s.args = create_buffer((UINT64)stride * pat.max, D3D12_HEAP_TYPE_UPLOAD);
+            uint8_t *m; CHECK(s.args->Map(0, nullptr, (void **)&m));
+            for (UINT i = 0; i < pat.max; i++, m += stride)
+            {
+                if (pat.constants)
+                {
+                    float rc[4] = { (float)(i % 64) / 32.0f - 1.0f, (float)(i / 64 % 64) / 32.0f - 1.0f, 0.01f, 0.5f };
+                    memcpy(m, rc, 16);
+                }
+                if (pat.vertices)
+                {
+                    D3D12_DRAW_ARGUMENTS d = { 3, 1, 0, 0 };
+                    memcpy(m + (pat.constants ? 16 : 0), &d, sizeof(d));
+                }
+                else if (pat.draw)
+                {
+                    D3D12_DRAW_INDEXED_ARGUMENTS d = { 3, 1, 0, 0, 0 };
+                    memcpy(m + (pat.constants ? 16 : 0), &d, sizeof(d));
+                }
+                else
+                {
+                    D3D12_DISPATCH_ARGUMENTS d = { 1, 1, 1 };
+                    memcpy(m, &d, sizeof(d));
+                }
+            }
+            s.args->Unmap(0, nullptr);
+            if (pat.count_buffer)
+            {
+                s.count = create_buffer(256, D3D12_HEAP_TYPE_UPLOAD);
+                uint32_t *c; CHECK(s.count->Map(0, nullptr, (void **)&c));
+                *c = pat.count;
+                s.count->Unmap(0, nullptr);
+            }
+        };
+        auto frame = [&pat, &s](bool direct) {
+            return [&pat, &s, direct](UINT f) {
+                D3D12_RESOURCE_BARRIER b = {};
+                b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                b.UAV.pResource = p.uav_buffer;
+                float rc[4] = { 0.0f, 0.0f, 0.01f, f * 0.001f };
+                if (pat.draw)
+                {
+                    set_quad_state(p.list, draw_pso);
+                    D3D12_INDEX_BUFFER_VIEW ibv = { indices->GetGPUVirtualAddress(), 256, DXGI_FORMAT_R16_UINT };
+                    p.list->IASetIndexBuffer(&ibv);
+                    p.list->SetGraphicsRoot32BitConstants(0, 4, rc, 0);
+                }
+                else
+                {
+                    uint32_t crc[4] = { f, 0, 0, 0 };
+                    p.list->SetComputeRootSignature(p.compute_root_signature);
+                    p.list->SetPipelineState(compute_pso);
+                    p.list->SetComputeRoot32BitConstants(0, 4, crc, 0);
+                    p.list->SetComputeRootUnorderedAccessView(1, p.uav_buffer->GetGPUVirtualAddress());
+                }
+                UINT executed = std::min(pat.count, pat.max);
+                double t = qpc_ms();
+                for (UINT call = 0; call < pat.calls; call++)
+                {
+                    if (pat.barrier_every && call && call % pat.barrier_every == 0)
+                        p.list->ResourceBarrier(1, &b);
+                    if (!direct)
+                    {
+                        p.list->ExecuteIndirect(s.sig, pat.max, s.args, 0, s.count, 0);
+                        // the root constants a command set are undefined after the call
+                        if (pat.constants)
+                            p.list->SetGraphicsRoot32BitConstants(0, 4, rc, 0);
+                        continue;
+                    }
+                    for (UINT i = 0; i < executed; i++)
+                    {
+                        if (pat.constants)
+                        {
+                            float c[4] = { (float)(i % 64) / 32.0f - 1.0f, (float)(i / 64 % 64) / 32.0f - 1.0f, 0.01f, 0.5f };
+                            p.list->SetGraphicsRoot32BitConstants(0, 4, c, 0);
+                        }
+                        if (pat.vertices)
+                            p.list->DrawInstanced(3, 1, 0, 0);
+                        else if (pat.draw)
+                            p.list->DrawIndexedInstanced(3, 1, 0, 0, 0);
+                        else
+                            p.list->Dispatch(1, 1, 1);
+                    }
+                    if (pat.constants)
+                        p.list->SetGraphicsRoot32BitConstants(0, 4, rc, 0);
+                }
+                extras.add("record_us_per_call", (qpc_ms() - t) * 1000.0 / pat.calls);
+            };
+        };
+        names.push_back(pat.name);
+        v.push_back({ names.back().c_str(), pat.desc, init, frame(false) });
+        names.push_back(std::string(pat.name) + "_direct");
+        v.push_back({ names.back().c_str(), "the same commands as Dispatch or DrawIndexedInstanced calls", init, frame(true) });
+    }
+    return v;
+}
+
 static std::vector<Scene> scenes()
 {
     std::vector<Scene> all = base_scenes(), more = more_scenes(), sm6 = sm6_scenes(), feat = feature_scenes(), eng = engine_scenes(),
-                       sub = submit_scenes();
+                       sub = submit_scenes(), ind = indirect_scenes();
     all.insert(all.end(), more.begin(), more.end());
     all.insert(all.end(), sm6.begin(), sm6.end());
     all.insert(all.end(), feat.begin(), feat.end());
     all.insert(all.end(), eng.begin(), eng.end());
     all.insert(all.end(), sub.begin(), sub.end());
+    all.insert(all.end(), ind.begin(), ind.end());
     return all;
 }
 

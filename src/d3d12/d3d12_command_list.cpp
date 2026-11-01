@@ -1869,6 +1869,15 @@ public:
     return Offset;
   }
 
+  // the root argument tables of `Count` commands whose resolver changes what their signature sets: room for each, and
+  // the list's arguments once (offsets in the heap), which the resolver copies into a command's table first. a copy of
+  // them per command written here cost a memcpy as long as MaxCommandCount whatever the count
+  std::pair<uint64_t, uint64_t>
+  EncodeRootArgumentTables(MTLD3D12RootSignature *pRootSig, uint64_t const pStaging[64], UINT Count) {
+    auto [_, tables] = allocator_->AllocateGPUHeap(sizeof(uint64_t) * pRootSig->UploadQwords * Count, 64);
+    return {tables, EncodeRootArgument(pRootSig, pStaging)};
+  }
+
   uint64_t
   EncodeStaticSamplers(MTLD3D12RootSignature *pRootSig) {
     auto static_sampler_encode_size = sizeof(uint64_t) * pRootSig->NumStaticSamplers * 4;
@@ -3691,9 +3700,34 @@ public:
       ResetIndirectState(sig, rays || sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH);
       return;
     }
+    // a signature of dispatches alone and no count buffer: each command is a dispatch of Metal's that reads its
+    // threadgroups where the arguments are (MTLDispatchThreadgroupsIndirectArguments is D3D12_DISPATCH_ARGUMENTS), as
+    // Dispatch would run them; no resolver, and no barrier between it and the commands, which made every call wait for
+    // the pass's dispatches before it. a few commands at most, as each is a dispatch to encode. predication, pipeline
+    // statistics, pipelines whose groups work together and MULLION_D3D12_GPU_ERRORS, which compares what the resolver
+    // reads, take the resolver
+    if (sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH && !sig->UpdateRootArguments && !pCountBuffer &&
+        MaxCommandCount <= kDirectCommands && !predication_region_ && active_statistics_.empty() && !diag::errors &&
+        !(pso_compute_ && pso_compute_->groups_work_together)) {
+      if (!PreDispatch())
+        return;
+      auto buffer = arg_buffer->buffer->current()->buffer();
+      for (UINT i = 0; i < MaxCommandCount; i++) {
+        auto &cmd = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch_indirect>();
+        cmd.type = WMTComputeCommandDispatchIndirect;
+        cmd.indirect_args_buffer = buffer;
+        cmd.indirect_args_offset = ArgBufferOffset + uint64_t(i) * sig->ByteStride;
+      }
+      Isolate(0, 0, 0);
+      return;
+    }
     if (rays || sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH) {
       IndirectComputeCommandData *cmd;
       bool parts = !rays && pso_compute_ && pso_compute_->groups_work_together;
+      // a few commands are dispatches of Metal's own, each of the threadgroups the resolver leaves for its command (none
+      // past the count), as `parts` has: an indirect command buffer's run of a call cost some ten microseconds of GPU
+      // time more than its dispatches, whatever they were
+      bool direct = !rays && !parts && MaxCommandCount <= kDirectCommands;
       uint32_t ray_flags = 0;
       if (rays) {
         // the resolver runs first, in the pass of the dispatches; without a pipeline it has no commands
@@ -3707,8 +3741,8 @@ public:
       } else {
         if (!PreDispatch(sig->UpdateRootArguments))
           return;
-        cmd = parts ? allocator_->EncodeComputeResolver(sig, MaxCommandCount)
-                    : allocator_->EncodeIndirectComputeCommand(sig, pso_compute_.ptr(), MaxCommandCount);
+        cmd = parts || direct ? allocator_->EncodeComputeResolver(sig, MaxCommandCount)
+                              : allocator_->EncodeIndirectComputeCommand(sig, pso_compute_.ptr(), MaxCommandCount);
         if (!active_statistics_.empty()) {
           // the resolver's threads write a command each
           size_t size = std::max<size_t>(MaxCommandCount, 1) * sizeof(uint64_t);
@@ -3725,7 +3759,10 @@ public:
       uint64_t root_arguments = 0;
 
       if (sig->UpdateRootArguments) {
-        root_arguments = EncodeRootArgument(rootsig_compute_.ptr(), rootarg_compute_staging_, MaxCommandCount, true);
+        uint64_t list_arguments;
+        std::tie(root_arguments, list_arguments) =
+            EncodeRootArgumentTables(rootsig_compute_.ptr(), rootarg_compute_staging_, MaxCommandCount);
+        cmd->rootsig_template = allocator_->gpu_heap_buffer_address_ + list_arguments;
         cmd->rootsig_qwords = root_arguments;
         cmd->rootsig_qwords += allocator_->gpu_heap_buffer_address_;
         cmd->rootsig_qwords_stride = rootsig_compute_->UploadQwords;
@@ -3758,6 +3795,34 @@ public:
           pass->type = EncoderType::ComputeParts;
         }
         allocator_->InvalidateCurrentPass();
+      } else if (direct) {
+        auto [_, at] = allocator_->AllocateGPUHeap(MaxCommandCount * sizeof(D3D12_DISPATCH_ARGUMENTS),
+                                                   alignof(D3D12_DISPATCH_ARGUMENTS));
+        cmd->dispatches = allocator_->gpu_heap_buffer_address_ + at;
+        auto &group = pso_compute_->threadgroup_size;
+        std::tie(cmd->tgsize_x, cmd->tgsize_y, cmd->tgsize_z) = std::tuple(group.width, group.height, group.depth);
+        // the resolver's pipeline was the pass's last
+        auto &pipeline = allocator_->EncodeComputeCommand<wmtcmd_compute_setpso>();
+        pipeline.type = WMTComputeCommandSetPSO;
+        pipeline.pso = pso_compute_->pso;
+        pipeline.threadgroup_size = group;
+        auto bind = [&](uint64_t offset, uint8_t index) {
+          auto &binding = allocator_->EncodeComputeCommand<wmtcmd_compute_setbuffer>();
+          binding.type = WMTComputeCommandSetBuffer;
+          binding.buffer = allocator_->gpu_heap_buffer_;
+          binding.offset = offset;
+          binding.index = index;
+        };
+        if (sig->UpdateRootArguments)
+          bind(cmd->static_samplers - allocator_->gpu_heap_buffer_address_, SM50_BINDING_INDEX_STATIC_SAMPLERS);
+        for (UINT i = 0; i < MaxCommandCount; i++) {
+          if (sig->UpdateRootArguments)
+            bind(root_arguments + i * rootsig_compute_->UploadQwords * sizeof(uint64_t), SM50_BINDING_INDEX_ROOT_ARGUMENTS);
+          auto &dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch_indirect>();
+          dispatch.type = WMTComputeCommandDispatchIndirect;
+          dispatch.indirect_args_buffer = allocator_->gpu_heap_buffer_;
+          dispatch.indirect_args_offset = at + i * sizeof(D3D12_DISPATCH_ARGUMENTS);
+        }
       } else if (rays) {
         // each command is a dispatch of the kernel, of the threadgroups the resolver counts for it
         auto [_, at] = allocator_->AllocateGPUHeap(MaxCommandCount * sizeof(IndirectRays), alignof(IndirectRays));
@@ -3799,6 +3864,51 @@ public:
       return;
     if (status != DrawCallStatus::Ordinary) {
       IMPLEMENT_ME // TODO: (potential) emulated pipeline
+    }
+    // a signature of draws alone (no index buffer: Metal does not keep indexed draws inside their view) and no count
+    // buffer, of an ordinary pipeline: each command is a draw of Metal's that reads its arguments where they are
+    // (MTLDrawPrimitivesIndirectArguments is D3D12_DRAW_ARGUMENTS), as DrawInstanced would run them, with no resolver
+    // or indirect command buffer. predication, pipeline statistics and MULLION_D3D12_GPU_ERRORS take the resolver
+    if (sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW && !encode_binding && !pCountBuffer &&
+        MaxCommandCount <= kDirectCommands && !predication_region_ && active_statistics_.empty() && !diag::errors) {
+      auto buffer = arg_buffer->buffer->current()->buffer();
+      for (UINT i = 0; i < MaxCommandCount; i++) {
+        auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_draw_indirect>();
+        cmd.type = WMTRenderCommandDrawIndirect;
+        cmd.primitive_type = primitive_type;
+        cmd.indirect_args_buffer = buffer;
+        cmd.indirect_args_offset = ArgBufferOffset + uint64_t(i) * sig->ByteStride;
+      }
+      return;
+    }
+    // a signature of indexed draws alone: its kernel leaves a few commands as Metal's indexed draws, which then run as
+    // they are, as DrawIndexedInstanced's: the indices in the view, those where the byte address wraps, and zeros past
+    // both, of an ordinary pipeline. an indirect command buffer's run cost about a microsecond more of GPU time a call
+    if (sig->draw_arguments_resolver && !encode_binding && MaxCommandCount <= kDirectCommands &&
+        active_statistics_.empty() && !diag::errors) {
+      auto data = allocator_->EncodeIndirectDrawArguments(sig, MaxCommandCount);
+      data->max_count_buffer = CountBufferAddress;
+      PredicateIndirect(data);
+      data->argument_buffer = ArgBufferAddress;
+      data->index_buffer_format = index_type == WMTIndexTypeUInt32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
+      data->index_buffer_size = index_buffer ? index_view_.SizeInBytes : 0;
+      auto heap = allocator_->gpu_heap_buffer_address_;
+      for (UINT i = 0; i < MaxCommandCount; i++)
+        for (unsigned k = 0; k < 4; k++) {
+          // the zeros are 16-bit indices of the heap; with no view all indices are zeros
+          bool zeros = k >= 2;
+          if (!zeros && !index_buffer)
+            continue;
+          auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_draw_indexed_indirect>();
+          cmd.type = WMTRenderCommandDrawIndexedIndirect;
+          cmd.primitive_type = primitive_type;
+          cmd.index_type = zeros ? WMTIndexTypeUInt16 : index_type;
+          cmd.index_buffer = zeros ? allocator_->gpu_heap_buffer_ : index_buffer;
+          cmd.index_buffer_offset = zeros ? data->zeros - heap : index_offset;
+          cmd.indirect_args_buffer = allocator_->gpu_heap_buffer_;
+          cmd.indirect_args_offset = data->draw_arguments - heap + (i * 4 + k) * 5 * sizeof(uint32_t);
+        }
+      return;
     }
 
     uint64_t statistics = 0, pixel_statistics = 0;
@@ -3868,14 +3978,29 @@ public:
     }
     if (!encode_binding)
       return;
-    cmd->rootsig_qwords = EncodeRootArgument(
-        rootsig_graphics_.ptr(), rootarg_graphics_staging_, MaxCommandCount, sig->UpdateRootArguments
-    );
+    // commands whose signature changes no root argument or vertex buffer share the list's table (a stride of zero);
+    // the others each have one, which the resolver fills in from the list's
+    if (sig->UpdateRootArguments) {
+      auto [tables, list_arguments] =
+          EncodeRootArgumentTables(rootsig_graphics_.ptr(), rootarg_graphics_staging_, MaxCommandCount);
+      cmd->rootsig_qwords = tables;
+      cmd->rootsig_template = allocator_->gpu_heap_buffer_address_ + list_arguments;
+      cmd->rootsig_qwords_stride = rootsig_graphics_->UploadQwords;
+    } else {
+      cmd->rootsig_qwords = EncodeRootArgument(rootsig_graphics_.ptr(), rootarg_graphics_staging_);
+      cmd->rootsig_qwords_stride = 0;
+    }
     cmd->rootsig_qwords += allocator_->gpu_heap_buffer_address_;
-    cmd->rootsig_qwords_stride = rootsig_graphics_->UploadQwords;
     cmd->static_samplers = EncodeStaticSamplers(rootsig_graphics_.ptr());
     cmd->static_samplers += allocator_->gpu_heap_buffer_address_;
-    auto [VBOffset, VBStride] = PopulateVertexBufferTable(MaxCommandCount, sig->UpdateVertexBuffers);
+    auto [VBOffset, VBStride] = PopulateVertexBufferTable(1);
+    if (sig->UpdateVertexBuffers && VBStride) {
+      auto [_, tables] = allocator_->AllocateGPUHeap(VBStride * MaxCommandCount, 16);
+      cmd->vertex_template = allocator_->gpu_heap_buffer_address_ + VBOffset;
+      VBOffset = tables;
+    } else {
+      VBStride = 0;
+    }
     cmd->vertex_buffer = allocator_->gpu_heap_buffer_address_ + VBOffset;
     cmd->vertex_argbuf_stride = VBStride;
     ResetIndirectState(sig, false);

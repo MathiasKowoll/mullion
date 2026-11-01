@@ -517,6 +517,9 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
     data->static_samplers = 0;
     data->vertex_buffer = 0;
     data->vertex_argbuf_stride = 0;
+    data->rootsig_template = 0;
+    data->vertex_template = 0;
+    data->draw_arguments = 0;
     data->primitive_type = 0;
     data->index_buffer = 0;
     data->index_buffer_format = {};
@@ -627,6 +630,37 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
   cmd.indirect_buffer_offset = Offset + offsetof(IndirectRenderCommandData, execution_range);
 
 
+  return data;
+}
+
+// a signature of indexed draws alone: its kernel leaves the commands' draws as Metal's indirect arguments in a compute
+// pass before the render pass, as EncodeIndirectRenderCommand's resolver does, and the caller draws them; the caller
+// fills in what the kernel reads of the list's state
+IndirectRenderCommandData *
+MTLD3D12CommandAllocatorImpl::EncodeIndirectDrawArguments(MTLD3D12CommandSignature *pCmdSig, size_t MaxCount) {
+  auto [Ptr, Offset] = AllocateGPUHeap(sizeof(IndirectRenderCommandData), 16);
+  if (records_)
+    RecordGPUHeap(Ptr, offsetof(IndirectRenderCommandData, execution_range), "indirect draw");
+  auto data = new (Ptr) IndirectRenderCommandData{};
+  data->max_count = MaxCount;
+  auto &zeros = *device_->recording.zeros;
+  data->zeros = gpu_heap_buffer_address_ + zeros.offset;
+  data->zero_count = zeros.length / sizeof(uint16_t);
+  auto [_, at] = AllocateGPUHeap(MaxCount * 4 * 5 * sizeof(uint32_t), 16);
+  data->draw_arguments = gpu_heap_buffer_address_ + at;
+
+  auto &pipeline = EncodeBeforeRender<wmtcmd_compute_setpso>();
+  pipeline.type = WMTComputeCommandSetPSO;
+  pipeline.pso = pCmdSig->draw_arguments_resolver;
+  pipeline.threadgroup_size = {pCmdSig->draw_arguments_resolver.maxTotalThreadsPerThreadgroup(), 1, 1};
+  auto &binding = EncodeBeforeRender<wmtcmd_compute_setbuffer>();
+  binding.type = WMTComputeCommandSetBuffer;
+  binding.buffer = gpu_heap_buffer_;
+  binding.offset = Offset;
+  binding.index = 30;
+  auto &dispatch = EncodeBeforeRender<wmtcmd_compute_dispatch>();
+  dispatch.type = WMTComputeCommandDispatchThreads;
+  dispatch.size = {MaxCount, 1, 1};
   return data;
 }
 

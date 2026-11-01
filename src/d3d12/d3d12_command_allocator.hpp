@@ -55,6 +55,8 @@ struct IndirectComputeCommandData {
   uint64_t statistics;
   WMTIndirectCommandBufferExecutionRange execution_range;
   uint64_t dispatches;
+  // the list's root arguments, which the resolver copies into each command's table before it changes them
+  uint64_t rootsig_template;
 };
 
 // what a command signature's resolver makes of an indirect DispatchRays command: the arguments of the pipeline's
@@ -134,9 +136,20 @@ struct IndirectRenderCommandData {
   uint64_t so_lacked;
   uint32_t statistics_first, statistics_step, statistics_cut, statistics_cuts;
   WMTIndirectCommandBufferExecutionRange execution_range;
+  // the list's root arguments and vertex buffer table, which the resolver copies into the command's own before it
+  // changes them, when the signature changes them; zero otherwise (the commands share one table)
+  uint64_t rootsig_template;
+  uint64_t vertex_template;
+  // a signature of indexed draws alone, run as Metal's draws (EncodeIndirectDrawArguments): four
+  // MTLDrawIndexedPrimitivesIndirectArguments a command, those resolve_indirect_commands draws as its four commands
+  uint64_t draw_arguments;
 };
 
 constexpr unsigned kIndexedCommands = 4;
+
+// the most commands of an ExecuteIndirect that run as Metal's indirect dispatches or draws, each a command to encode
+// and to run even past the count, instead of as an indirect command buffer's
+constexpr unsigned kDirectCommands = 16;
 
 // the words of IndirectRenderCommandData::most: five numbers of the commands and how many commands there were
 constexpr unsigned kMostWords = 6;
@@ -513,6 +526,7 @@ public:
   IndirectComputeCommandData *EncodeComputeResolver(MTLD3D12CommandSignature *pCmdSig, size_t MaxCount);
   IndirectComputeCommandData *EncodeIndirectComputeCommand(MTLD3D12CommandSignature *pCmdSig, MTLD3D12ComputePipelineState *pPSO, size_t MaxCount);
 
+  IndirectRenderCommandData *EncodeIndirectDrawArguments(MTLD3D12CommandSignature *pCmdSig, size_t MaxCount);
   // `Pipeline` is the variant of pPSO that the commands draw with
   IndirectRenderCommandData *EncodeIndirectRenderCommand(
       MTLD3D12CommandSignature *pCmdSig, MTLD3D12GraphicsPipelineState *pPSO, WMT::RenderPipelineState Pipeline,
