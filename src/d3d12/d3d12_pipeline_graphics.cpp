@@ -995,9 +995,18 @@ public:
     info.raster_sample_count = !rtv_mask && !dsv_mask && pDesc->RasterizerState.ForcedSampleCount
                                    ? pDesc->RasterizerState.ForcedSampleCount
                                    : std::max(pDesc->SampleDesc.Count, 1u);
-    // refused before its shaders are compiled for a pipeline Metal would refuse
+    // refused before its shaders are compiled for a pipeline Metal would refuse. CheckFeatureSupport asks Metal the
+    // same, so no format has quality levels at this count (D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS). the count is
+    // a byte, which the log would print as a character
     if (!device_->GetMTLDevice().supportsTextureSampleCount(info.raster_sample_count)) {
-      WARN("InitializePSO: ", info.raster_sample_count, " samples, which this GPU does not rasterize");
+      WARN(
+          "InitializePSO: ", uint32_t(info.raster_sample_count), " samples, which this GPU does not rasterize (",
+          !rtv_mask && !dsv_mask && pDesc->RasterizerState.ForcedSampleCount
+              ? "ForcedSampleCount without targets"
+              : "SampleDesc.Count",
+          ", render target 0 format ", uint32_t(pDesc->RTVFormats[0]), ", depth format ", uint32_t(pDesc->DSVFormat),
+          ")"
+      );
       return FAIL(E_INVALIDARG);
     }
     // Metal refuses a mesh pipeline that asks for indirect command buffers on GPUs before Apple9, where mesh draws

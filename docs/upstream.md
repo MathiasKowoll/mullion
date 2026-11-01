@@ -173,3 +173,5 @@ Commits on main that neither upstream has, oldest first.
 | `43f3bb2` | nvapi: a function it does not implement is named once |
 | `8bd6b15` | d3d12: the recording arena's mappings begin where it begins |
 | `0b71541` | nvapi: a GPU's adapter ID is its DXGI adapter's LUID |
+| `84e4902` | d3d12: a refused state object says why, and leaves what it was made of (branch `rtpso-raygen`) |
+| `b7b3043` | d3d12: a pipeline refused for its sample count says the count (branch `rtpso-raygen`) |
