@@ -178,3 +178,5 @@ Commits on main that neither upstream has, oldest first.
 | `722ba52` | d3d12: a profile records what each frame's submissions wait on (branch `frame-profile`; DXMT has no profiler to map it to) |
 | `00d2609` | tools: mullion-diag judges each frame by the GPU's idle time (branch `frame-profile`) |
 | `7c239fa` | tests: held.py checks the frame verdict against frames of known bounds (branch `frame-profile`) |
+| `6467544` | tests: the perf probe pairs ExecuteIndirect calls with the same work issued directly (branch `indirect-cost`) |
+| `8649192` | d3d12: ExecuteIndirect of a few dispatches or draws runs them as Metal's own (branch `indirect-cost`) |
