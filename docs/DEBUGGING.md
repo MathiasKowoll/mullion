@@ -175,8 +175,13 @@ Wine's console output names the file. A process that ends after such a dump adds
 
 **A slow frame** is profiled with `MULLION_DIAG=profile` and `MULLION_DIAG_PATH`, a macOS directory, and read with
 [`tools/mullion-diag`](../tools/mullion-diag): `mullion-diag report <directory>` lists frame times and where their
-time goes, and `mullion-diag frames <directory>` summarizes the present intervals of each recording. Its own
-description lists what the records do not cover, and how D3D12 passes are timed on Metal 4 and Metal 3;
+time goes, and `mullion-diag frames <directory>` summarizes the present intervals of each recording. The report says
+of each frame whether the GPU was busy (any queue's command buffer running 90% of it or more) or idle, and what held
+it idle: command buffers committed and not started, held back by a queue's Wait, a wait for a drawable, Mullion's
+translation or its own waits, the presenting thread's fence and frame latency waits, or the application. It gives the
+GPU's idle gaps, each queue's busy time and the direct and compute queues' overlap, each command buffer's way from
+ExecuteCommandLists to the GPU's start, and the CPU's side: the time between Present calls and inside them, waits,
+submissions, Mullion's encoding and the time lists are open. Its own description lists what the records do not cover, and how D3D12 passes are timed on Metal 4 and Metal 3;
 [`tests/held.py`](../tests/held.py) checks the profile against workloads whose bounds and passes are known.
 {logging: one offline report that gathers a run's logs, profiles, stacks and shader dumps}.
 

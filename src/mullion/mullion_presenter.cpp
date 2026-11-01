@@ -163,7 +163,11 @@ Presenter::encodeCommands(
   layer_.setProps(state.layer_props);
   layer_.setColorSpace(state.colorspace);
 
+  // a wait for the display to give back a drawable, which a frame faster than the display's ends in
+  auto waiting = diag::profile && layer_ ? diag::Now() : 0;
   auto drawable = layer_ ? layer_.nextDrawable() : WMT::MetalDrawable{};
+  if (waiting)
+    diag::Waited("drawable", waiting);
   auto number = ++frames_;
   if (drawable)
     drawable.countPresent(statistics_, number);
