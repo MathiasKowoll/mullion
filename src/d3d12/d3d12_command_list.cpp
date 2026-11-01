@@ -127,6 +127,8 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
   Flags<DirtyState> dirty_state_;
   D3D12_COMMAND_LIST_TYPE type_;
   HRESULT recording_error_ = S_OK;
+  // MULLION_DIAG=profile: when the list was last reset, which its Close writes as a span of recording
+  uint64_t recording_began_ = 0;
   // the resolves the render pass runs when it ends
   std::vector<std::pair<D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_PARAMETERS, D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_SUBRESOURCE_PARAMETERS>>
       pass_resolves_;
@@ -764,6 +766,8 @@ public:
   HRESULT
   Initialize(ID3D12CommandAllocator *pAllocator, ID3D12PipelineState *pInitialPipelineState) {
     auto allocator = static_cast<MTLD3D12CommandAllocatorImpl *>(pAllocator);
+    if (diag::profile)
+      recording_began_ = diag::Now();
 
     if (allocator_ != allocator)
       allocator_ = allocator;
@@ -842,6 +846,11 @@ public:
     // the error code is returned here", ID3D12GraphicsCommandList::Close)
     if (FAILED(recording_error_))
       allocator_->Discard(entry);
+    // the list's time open, from Reset to Close: the application's recording and Mullion's in its calls together
+    if (auto began = std::exchange(recording_began_, 0)) {
+      auto now = diag::Now();
+      diag::Later(diag::Line("span", "record", encoder_count, GetCurrentThreadId(), began, now - began), now);
+    }
     return recording_error_;
   };
 
