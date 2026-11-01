@@ -172,3 +172,4 @@ Commits on main that neither upstream has, oldest first.
 | `2a323ca` | tests: held.py checks the profile's passes against command buffer spans |
 | `43f3bb2` | nvapi: a function it does not implement is named once |
 | `8bd6b15` | d3d12: the recording arena's mappings begin where it begins |
+| `0b71541` | nvapi: a GPU's adapter ID is its DXGI adapter's LUID |
