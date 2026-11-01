@@ -348,42 +348,57 @@ def calibrated(directory):
 
 
 def held(directory):
-    # contract: a frame is the time of the thread that presents. while it waits, the GPU running, the GPU waiting for
-    # a command buffer Mullion was translating, one no thread of Mullion was making (the application), or one
-    # committed and not started holds it; its own calls into Mullion are Mullion's; the rest is the application's,
-    # whatever other threads do meanwhile. a hitch is a frame over twice the median (mullion-diag, bounds). the
-    # frames read Metal's host clock 500 ns behind theirs, and every expected time below is taken from these
-    # intervals by hand
+    # contract: a moment any queue's command buffer runs is the GPU's; an idle one is the first that holds of a command
+    # buffer committed and not started (queued), one Mullion ended and a Wait keeps uncommitted (gate), a thread's wait
+    # for a drawable, Mullion translating or the presenting thread in Mullion's calls (mullion), that thread waiting on
+    # a fence or a latency object, and otherwise the application. a frame is GPU-bound at 90% busy, else held idle by
+    # its largest idle cause; a hitch is a frame over twice the median (mullion-diag, bounds). the frames read Metal's
+    # host clock 500 ns behind theirs, and every expected time below is taken from these intervals by hand
     lines = [
         "frame\tq\t1\t1000\t500", "frame\tq\t2\t2000\t1500", "frame\tq\t3\t3000\t2500",
         "frame\tq\t4\t6000\t5500",
+        "queue\ta\t0", "queue\tb\t2",
         # committed, completed, then the GPU's start and end on the host clock
         "cmdbuf\ta\t1\t1100\t0\t700\t1100",   # runs 1200 to 1600
-        "cmdbuf\tb\t1\t1250\t0\t800\t900",    # inside the first, on another queue
+        "cmdbuf\tb\t1\t1250\t0\t800\t900",    # inside the first, on the compute queue
         "cmdbuf\tb\t2\t1450\t0\t1000\t1200",  # past the first's end, to 1700
         "cmdbuf\ta\t2\t1900\t0\t1500\t2300",  # 2000 to 2800
         "cmdbuf\ta\t3\t2950\t0\t2450\t2450",  # never ran
+        # submitted at 5000, ended at 5100, held by a Wait until its commit at 5200, run 5300 to 5400
+        "cmdbuf\tc\t1\t5200\t0\t4800\t4900\t5000\t5100",
         # work of Mullion's thread 1: translating 1050 to 1100, then 3100 to 5000 while the application works
         "span\texecute\t1\t1\t1050\t50", "span\tencode\t2\t1\t3100\t1900",
         # thread p presents, and waits 1000 to 1700 and 2000 to 2800; thread w's wait holds no frame
         "span\tpresent\t\tp\t1980\t20", "span\tpresent\t\tp\t2990\t10", "span\tpresent\t\tp\t5990\t10",
         "span\twait\tfence\tp\t1000\t700", "span\twait\tfence\tp\t2000\t800",
         "span\twait\tfence\tw\t3000\t1000",
+        # a queue's thread waits for a drawable 5600 to 5700
+        "span\twait\tdrawable\th\t5600\t100",
     ]
     path = directory / "mullion-3.diag"
     path.write_text("\n".join(lines) + "\n")
+    zero = dict.fromkeys(tool.CAUSES, 0)
     rows = tool.bounds(tool.Record(path))
-    assert [(r["frame"], r["length"], r["causes"], r["bound"], r["hitch"]) for r in rows] == [
-        # the wait: 1000 to 1050 nothing, 1050 to 1100 translating, 1100 to 1200 queued, 1200 to 1700 the GPU
-        (1, 1000, {"gpu": 500, "mullion": 70, "application": 330, "queued": 100}, "gpu", False),
-        (2, 1000, {"gpu": 800, "mullion": 10, "application": 190, "queued": 0}, "gpu", False),
-        (3, 3000, {"gpu": 0, "mullion": 10, "application": 2990, "queued": 0}, "application", True),
+    assert [(r["frame"], r["length"], r["causes"], r["bound"], r["verdict"], r["hitch"]) for r in rows] == [
+        # idle 1000 to 1200 and 1700 to 2000: queued 1100 to 1200 and 1900 to 2000, translating 1050 to 1100, the
+        # presenting thread's fence wait 1000 to 1050, and 1700 to 1900 the application's
+        (1, 1000, dict(zero, gpu=500, queued=200, mullion=50, fence=50, application=200), "gpu", "queued", False),
+        (2, 1000, dict(zero, gpu=800, mullion=10, application=190), "gpu", "application", False),
+        (3, 3000, dict(zero, gpu=100, queued=100, gate=100, drawable=100, mullion=1910, application=690), "mullion",
+         "mullion", True),
     ], rows
-    # a record without Metal's host clock beside its frames, or with no thread that presents, has no verdict
+    assert [(r["gaps"], r["queues"], r["overlap"]) for r in rows] == [
+        ([200, 300], {"a": 400, "b": 300}, 200), ([200], {"a": 800}, 0), ([2300, 600], {"c": 100}, 0)]
+    assert [r["latency"] for r in rows] == [[], [], [(300, 5100, 5200, 5300, 5000)]]
+    assert [r.get("interval") for r in rows] == [1010, 3000, None] and rows[0]["present"] == 10
+    # a record without Metal's host clock beside its frames has no verdict
     path.write_text("\n".join(line.rsplit("\t", 1)[0] if line.startswith("frame") else line for line in lines) + "\n")
     assert tool.bounds(tool.Record(path)) == []
+    # with no thread that presents, no thread's calls or fence waits hold a frame
     path.write_text("\n".join(line for line in lines if "present" not in line) + "\n")
-    assert tool.bounds(tool.Record(path)) == []
+    assert [r["causes"] for r in tool.bounds(tool.Record(path))] == [
+        dict(zero, gpu=500, queued=200, mullion=50, application=250), dict(zero, gpu=800, application=200),
+        dict(zero, gpu=100, queued=100, gate=100, drawable=100, mullion=1900, application=700)]
 
 
 with tempfile.TemporaryDirectory() as directory:
